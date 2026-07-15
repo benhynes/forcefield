@@ -111,6 +111,7 @@ old tokens fail closed after restart unless the old revision remains available.
 - [Configuration and policy reference](docs/configuration.md)
 - [Operating: start, mint, use, delegate, revoke, and roll out policy](docs/operations.md)
 - [Client recipes: curl, OpenAI, and Anthropic](docs/client-recipes.md)
+- [Automatic agent capability awareness: live manifest, Claude hooks, and MCP](docs/agent-awareness.md)
 - [Threat model and residual risks](docs/threat-model.md)
 
 ## Supported now
@@ -123,6 +124,8 @@ old tokens fail closed after restart unless the old revision remains available.
 - `agent-secret` and other no-shell exec credential helpers
 - Development-only environment credential lookup
 - Expiring, revocable, monotonically delegated capability tokens
+- Authenticated live capability discovery, a guest CLI, and Claude hook/MCP
+  integration
 
 ## Not supported yet
 

@@ -81,6 +81,34 @@ route is removed before evaluation: a request to `/github/repos/o/r` under
 `path_prefix: /github` is evaluated and forwarded as `/repos/o/r` (plus any
 configured path already present in the upstream URL).
 
+## Capability discovery lifecycle
+
+The data plane reserves the exact path
+`/.well-known/forcefield/capabilities` for an authenticated, freshly generated
+projection of the caller's revision-current configured grants. It accepts only
+GET without a query or body, and always
+extracts the broker token from `Authorization: Bearer` so discovery does not
+depend on any one service's client-auth convention.
+
+Forcefield derives and validates the workload exactly as it does for a service
+request, validates the token/audience/expiry/revocation chain, drops grants
+whose policy or binding revision is no longer current, and renders a bounded,
+sorted manifest. The projection includes public routing/auth conventions,
+operator-authored summaries, configured ceilings, and generation/token-expiry
+timestamps. Configured ceilings are not remaining quota, so an advertised
+grant may already be exhausted. It omits bearer and provider credentials, secret references,
+private upstreams, public token/grant IDs, and policy internals.
+
+Discovery never fetches a secret, calls an upstream, or charges a service
+request/byte budget. After authentication, a separate per-workload limiter
+allows 2 successful lookups per second with a burst of 16. Malformed and
+unauthenticated denial audits are globally sampled to bound storage without
+starving valid discovery. Authorization is recorded before the response, and a
+completion record carries the actual status and bytes written. Responses use
+`Cache-Control: no-store`; authentication and workload failures use the generic
+404. The manifest is advisory and can become stale immediately after return.
+The ordinary request lifecycle remains the enforcement boundary.
+
 ## Service, credential, policy, role, and token
 
 These are separate because each is a different security decision:

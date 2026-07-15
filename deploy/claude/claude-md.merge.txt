@@ -1,0 +1,10 @@
+External-service access is brokered by Forcefield. A live capability snapshot
+is injected at every session and subagent start. Treat it as advisory:
+Forcefield validates every request and remains authoritative. Before an
+external API call when freshness matters, call
+mcp__forcefield__capabilities. Use the Forcefield token file and mTLS private
+key only through the managed Forcefield discovery commands or as client inputs
+for the exact Forcefield service origins shown in the current snapshot. Never
+print, include in chat or logs, copy elsewhere, or transmit either value to a
+provider or any other origin. A generic 404 can mean either nonexistent or
+outside the current grant.

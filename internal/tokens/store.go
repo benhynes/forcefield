@@ -744,7 +744,7 @@ func cloneRecords(records map[tokenHash]record) map[tokenHash]record {
 }
 
 func wellFormedBearer(bearer string) bool {
-	if len(bearer) != len(BearerPrefix)+base64.RawURLEncoding.EncodedLen(tokenBytes) || !strings.HasPrefix(bearer, BearerPrefix) {
+	if len(bearer) != BearerLength || !strings.HasPrefix(bearer, BearerPrefix) {
 		return false
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(bearer[len(BearerPrefix):])
@@ -753,6 +753,24 @@ func wellFormedBearer(bearer string) bool {
 	}
 	canonical := BearerPrefix + base64.RawURLEncoding.EncodeToString(decoded)
 	return subtle.ConstantTimeCompare([]byte(canonical), []byte(bearer)) == 1
+}
+
+// ContainsBearer reports whether value contains a canonically encoded
+// Forcefield bearer. It is intended for defense-in-depth validation of text
+// that will be exposed to agents or logs, not for token authentication.
+func ContainsBearer(value string) bool {
+	for offset := 0; offset < len(value); {
+		relative := strings.Index(value[offset:], BearerPrefix)
+		if relative < 0 {
+			return false
+		}
+		start := offset + relative
+		if len(value)-start >= BearerLength && wellFormedBearer(value[start:start+BearerLength]) {
+			return true
+		}
+		offset = start + len(BearerPrefix)
+	}
+	return false
 }
 
 func hashToken(bearer string) tokenHash {

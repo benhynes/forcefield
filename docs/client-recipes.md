@@ -20,6 +20,27 @@ export ANTHROPIC_MODEL=your-approved-anthropic-model
 The `ff_` token is scoped but still bearer material. It is acceptable for the
 assigned agent to see; do not send it to any endpoint except Forcefield.
 
+For an autonomous guest, provision the bearer as a regular 0600 file and let
+`ff capabilities` or the Forcefield MCP server read it. Those commands expose a
+fresh, secret-free description of revision-current configured grants without
+printing the bearer:
+
+```sh
+ff capabilities \
+  --url "$FORCEFIELD_URL" \
+  --token-file /run/forcefield/token \
+  --ca-cert /run/forcefield/ca.crt \
+  --client-cert /run/forcefield/client.crt \
+  --client-key /run/forcefield/client.key
+```
+
+Managed agent runtimes can inject that output at startup and offer an MCP
+refresh tool; see [Automatic agent capability awareness](agent-awareness.md).
+This discovery text is advisory. A generic 404 from a real request can mean
+either nonexistent or outside the current grant, and the gateway remains
+authoritative. Remaining quota is not reported, so a listed grant can already
+be exhausted.
+
 ## curl: REST
 
 GitHub repository metadata:

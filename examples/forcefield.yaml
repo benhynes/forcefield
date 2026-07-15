@@ -1,12 +1,15 @@
 # Production-oriented template. It is safe by default for LLM writes because
-# model allowlists are non-working placeholders. Replace paths, PKI, upstream
-# credential scopes, approved models, and tested upstream API-version pins for
-# your environment.
+# model allowlists are non-working placeholders. Replace paths, the advertised
+# origin, PKI, upstream credential scopes, approved models, and tested upstream
+# API-version pins for your environment.
 version: 1
 
 server:
   listen: 0.0.0.0:7902
   audience: forcefield-prod
+  # Public data-plane origin reachable from workloads. This is advertised in
+  # the authenticated capability manifest; it is not an upstream URL.
+  advertised_base_url: https://forcefield.internal:7902
   admin_socket: /REPLACE/WITH/PRIVATE/FORCEFIELD/admin.sock
   tls_cert: /REPLACE/WITH/PRIVATE/FORCEFIELD/pki/server.crt
   tls_key: /REPLACE/WITH/PRIVATE/FORCEFIELD/pki/server.key
@@ -98,6 +101,7 @@ credentials:
 policies:
   github-read:
     service: github
+    capability_summary: Read approved repository metadata, contents, actions metadata, filtered issues, and named AgentRead GraphQL queries.
     body_limit: 262144
     rules:
       # This overlaps allow-actions-read. Deny wins regardless of source order.
@@ -162,6 +166,7 @@ policies:
 
   openai-bounded:
     service: openai
+    capability_summary: Create non-stored Responses with an operator-approved model and at most 2048 output tokens.
     body_limit: 1048576
     cel_cost_limit: 10000
     cel_timeout: 10ms
@@ -198,6 +203,7 @@ policies:
 
   anthropic-bounded:
     service: anthropic
+    capability_summary: Create Messages with an operator-approved model and at most 2048 output tokens.
     body_limit: 1048576
     cel_cost_limit: 10000
     cel_timeout: 10ms

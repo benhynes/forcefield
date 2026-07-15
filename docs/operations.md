@@ -1,6 +1,7 @@
 # Operating Forcefield
 
-Forcefield has one long-running command and a small control-plane CLI:
+Forcefield has one long-running command, a small control-plane CLI, and guest
+capability-discovery commands:
 
 ```text
 ff serve    --config FILE
@@ -9,12 +10,16 @@ ff mint     --config FILE --role ROLE --workload ID [--ttl 1h]
 ff delegate --config FILE --caller-workload ID --workload CHILD [options] < parent-token
 ff revoke   --config FILE --token-id TOKEN_ID
 ff identity --ip ADDRESS | --cert CLIENT_CERT
+ff capabilities --url ORIGIN --token-file FILE [connection options]
+ff mcp      --url ORIGIN --token-file FILE [connection options]
 ff version
 ```
 
 All administrative commands load and validate the config to discover the Unix
 admin socket. They must run as the same trusted host user as `ff serve`. Do not
 expose that socket into a VM or run untrusted agents under that host account.
+`capabilities` and `mcp` are guest-side data-plane clients: they do not load the
+server config or use the admin socket.
 
 ## Prepare the host
 
@@ -142,6 +147,47 @@ Deliver the token through the VM's authenticated provisioning channel. A 0600
 guest file or process environment can be practical, but the agent can read its
 own token by design. Do not put it in an image, shared filesystem, audit log, or
 host command-line argument. The provider credential must never accompany it.
+
+For automatic agent discovery, use a regular, non-symlink token file with no
+group/world permissions, normally `/run/forcefield/token` at mode `0600`.
+Provision it atomically along with the Forcefield server CA and, for an mTLS
+workload, its client certificate and 0600 private key. Do not expose the admin
+socket, server token store, configuration, secret-helper state, or provider
+credential to the guest.
+
+## Make agents capability-aware
+
+The guest can fetch a fresh, secret-free projection of its revision-current
+configured concrete grants:
+
+```sh
+ff capabilities \
+  --url https://forcefield.internal:7902 \
+  --token-file /run/forcefield/token \
+  --ca-cert /run/forcefield/ca.crt \
+  --client-cert /run/forcefield/client.crt \
+  --client-key /run/forcefield/client.key
+```
+
+The command calls `GET /.well-known/forcefield/capabilities` with the scoped
+bearer, validates TLS and the bounded response, and prints agent-readable text.
+Use `--json` for the machine-readable manifest. The endpoint validates the
+current workload/token and omits stale policy or binding revisions; it does not
+look up a provider secret, call an upstream, or consume service request/byte
+budgets. Discovery has its own per-workload limit of 2 requests per second with
+a burst of 16 after authentication. Configured ceilings are not remaining
+quota, and a listed grant may already be exhausted. Failures remain opaque, so
+a generic 404 can mean invalid, revoked,
+misbound, outside the grant, or nonexistent.
+
+For Claude Code, install managed `SessionStart` and `SubagentStart` hooks that
+run the same command with `--format claude-hook`, plus the local `ff mcp` server
+for on-demand refresh. Large MCP results are cursor-paginated; follow the
+returned cursor until complete. See [Automatic agent capability
+awareness](agent-awareness.md) and the safe examples under
+[`deploy/claude`](../deploy/claude/). The injected text is advisory and can
+become stale immediately after revocation or rollout; Forcefield remains
+authoritative on every real request.
 
 ## Use
 

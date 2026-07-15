@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "forcefield": {
+      "type": "stdio",
+      "command": "/usr/local/bin/ff",
+      "alwaysLoad": true,
+      "args": [
+        "mcp",
+        "--url",
+        "https://forcefield.internal:7902",
+        "--token-file",
+        "/run/forcefield/token",
+        "--ca-cert",
+        "/run/forcefield/ca.crt",
+        "--client-cert",
+        "/run/forcefield/client.crt",
+        "--client-key",
+        "/run/forcefield/client.key"
+      ]
+    }
+  }
+}

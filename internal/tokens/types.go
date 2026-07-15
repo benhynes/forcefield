@@ -16,6 +16,10 @@ const (
 	// BearerPrefix makes Forcefield tokens easy to identify and redact. The
 	// suffix is the unpadded base64url encoding of 32 random bytes.
 	BearerPrefix = "ff_"
+	// BearerLength is the exact encoded length of a Forcefield bearer. It is
+	// exported so secret-free projections can reject embedded bearer material
+	// without accepting arbitrary ff_-prefixed prose as a secret.
+	BearerLength = 46
 
 	defaultMaxDelegationDepth  = 4
 	defaultMaxChildrenPerToken = 32

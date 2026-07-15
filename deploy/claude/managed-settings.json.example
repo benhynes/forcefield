@@ -1,0 +1,59 @@
+{
+  "allowManagedHooksOnly": true,
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/ff",
+            "args": [
+              "capabilities",
+              "--url",
+              "https://forcefield.internal:7902",
+              "--token-file",
+              "/run/forcefield/token",
+              "--ca-cert",
+              "/run/forcefield/ca.crt",
+              "--client-cert",
+              "/run/forcefield/client.crt",
+              "--client-key",
+              "/run/forcefield/client.key",
+              "--format",
+              "claude-hook"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/ff",
+            "args": [
+              "capabilities",
+              "--url",
+              "https://forcefield.internal:7902",
+              "--token-file",
+              "/run/forcefield/token",
+              "--ca-cert",
+              "/run/forcefield/ca.crt",
+              "--client-cert",
+              "/run/forcefield/client.crt",
+              "--client-key",
+              "/run/forcefield/client.key",
+              "--format",
+              "claude-hook"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -111,6 +111,25 @@ narrows by service subset only; it does not expose per-limit tightening. Do not
 set `--allow-delegation` unless the workload genuinely needs to mint child
 capabilities through a trusted host-side operator path.
 
+## Capability discovery and agent context
+
+The freshly generated capability manifest is authenticated with the same bearer
+and workload identity. It deliberately reveals public service routes, auth conventions,
+operator-authored scope summaries, configured ceilings, and expiry to that
+workload, but never returns the bearer, provider credential, secret reference,
+private upstream, or internal token/grant IDs. Treat the manifest as scoped
+authority metadata and do not publish it outside the workload.
+Configured ceilings are not remaining quota, so presence in the manifest is
+not a promise that a request or byte budget still has capacity.
+
+Startup hooks and MCP make this metadata easier for an agent to consume; they
+do not make model context a security boundary. Context can be stale, ignored,
+or manipulated by other instructions. A lookup failure must mean "no
+capabilities confirmed," not permission to proceed, and the data plane must
+still authorize every request. Keep managed hook/MCP configuration
+administrator-owned, pass only a 0600 token-file path, and never expose the
+admin socket to the guest integration.
+
 ## Confused-deputy and SSRF controls
 
 The client cannot supply an upstream URL. A route selects a configured HTTPS
@@ -246,5 +265,7 @@ again at the provider or an external durable accounting layer.
 - Forward only the headers the API requires.
 - Exercise both expected allows and adversarial denies before minting live tokens.
 - Retain old policy revisions during a controlled migration or revoke/re-mint.
+- Keep capability hooks/MCP root-managed and treat injected grant text as
+  advisory, never as authorization.
 - Rotate the upstream key and revoke Forcefield tokens after suspected compromise.
 - Never use a permissive observe mode; Forcefield intentionally has none.

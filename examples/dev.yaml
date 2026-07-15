@@ -5,6 +5,7 @@ version: 1
 server:
   listen: 127.0.0.1:7902
   audience: forcefield-dev
+  advertised_base_url: http://127.0.0.1:7902
   admin_socket: /REPLACE/WITH/PRIVATE/FORCEFIELD_DEV/admin.sock
   read_timeout: 30s
   max_token_ttl: 1h
@@ -44,6 +45,7 @@ credentials:
 policies:
   demo-bounded:
     service: demo
+    capability_summary: List public resources and create bounded note or task resources; delete and admin creation are denied.
     body_limit: 65536
     cel_cost_limit: 10000
     cel_timeout: 10ms

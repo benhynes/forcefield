@@ -37,6 +37,7 @@ contain only lowercase letters, digits, `-`, or `_` (maximum 128 characters).
 |---|---|---|
 | `listen` | `127.0.0.1:7902` | TCP data-plane address, including host and port. |
 | `audience` | `forcefield` | Exact audience embedded in and checked on all tokens. |
+| `advertised_base_url` | empty | Canonical HTTP(S) origin (at most 512 bytes) advertised to authenticated capability clients, for example `https://forcefield.internal:7902`. It is not an upstream URL. |
 | `admin_socket` | required, absolute | Private Unix control-socket path. Its parent must be a non-symlink private directory. |
 | `tls_cert` | optional pair | PEM server certificate chain. Requires `tls_key`. |
 | `tls_key` | optional pair | PEM server private key. Requires `tls_cert`. |
@@ -51,6 +52,16 @@ contain only lowercase letters, digits, `-`, or `_` (maximum 128 characters).
 TLS minimum version is 1.2. When `client_ca` is set, clients must present a
 certificate chaining to that pool. When it is absent, the workload identity is
 the direct peer IP even if ordinary server TLS is enabled.
+
+`advertised_base_url` must contain only a scheme and authority: no userinfo,
+path, query, or fragment. HTTPS is required except for a loopback development
+origin. Set it to the data-plane origin the guest actually uses, not `listen`
+and never a provider upstream. It supplies complete public service URLs in the
+live capability manifest; when omitted, the manifest still reports each
+path/host route. It does not redirect requests or weaken routing. Host-routed
+services require an HTTPS advertised origin. The advertised origin is included
+in each credential binding revision, so changing it requires re-minting tokens
+under the new binding.
 
 Mint/delegate workload IDs are deliberately not free-form. The control plane
 accepts only `ip:<canonical-unmapped-IP>` or
@@ -164,12 +175,12 @@ services:
 | Field | Required/default | Meaning |
 |---|---|---|
 | `upstream` | required | Fixed absolute HTTP(S) base. No userinfo, query, or fragment. HTTPS is required by default. |
-| `path_prefix` | exactly one route | Public path route such as `/github`; not `/`, trailing `/`, or repeated slash. Longest matching prefix wins. |
+| `path_prefix` | exactly one route | Public path route such as `/github`; at most 4096 bytes and not `/`, trailing `/`, repeated slash, unsafe display controls, or embedded bearer material. Longest matching prefix wins. When an advertised origin is configured, the derived service URL must also fit the 4096-byte manifest field. |
 | `host` | exactly one route | Exact lowercase DNS hostname route instead of a path prefix. IP literals and trailing dots are invalid. |
 | `allow_insecure_upstream` | `false` | Allows a configured `http` upstream. Never use for production credentials. |
 | `allowed_cidrs` | empty | Explicit private/special address exceptions for this configured upstream's DNS results. |
 | `pinned_spki_sha256` | empty | Standard-base64 SHA-256 SPKI pins, additive to normal TLS verification. |
-| `client_auth.header` | required | Header from which exactly one `ff_` bearer is extracted. |
+| `client_auth.header` | required | Header from which exactly one `ff_` bearer is extracted; at most 256 bytes. |
 | `client_auth.prefix` | empty | Exact prefix removed before validating the `ff_` token. |
 | `forward_headers` | empty | Agent-controlled inbound headers rebuilt upstream. Known credential/key/token/session/signature names and unsafe/hop-by-hop names are rejected. |
 | `static_headers` | empty | Non-secret operator-controlled values installed after forwarding and before credential injection. The same credential-bearing names are rejected; use this map to pin semantic/version headers. |
@@ -180,6 +191,10 @@ Routes and route/base paths must already be canonical. Policy always sees the ro
 may itself have a base path: with upstream `https://api.openai.com/v1`, public
 prefix `/openai`, and request `/openai/responses`, Forcefield sends
 `https://api.openai.com/v1/responses` and policy matches `/responses`.
+
+The exact data-plane path `/.well-known/forcefield/capabilities` is reserved
+for authenticated capability discovery. A service path prefix cannot equal or
+be an ancestor of that path.
 
 SPKI pins are the standard-base64 SHA-256 digest of certificate
 SubjectPublicKeyInfo, not hex and not a certificate fingerprint. Plan for pin
@@ -212,7 +227,8 @@ Each credential belongs to exactly one service. `secret_ref` is passed verbatim
 as the final helper argument (or appended to `env_prefix` for the env backend).
 References are at most 512 bytes; the env backend accepts only letters, digits,
 and underscore, while exec also accepts non-leading `.`, `-`, `:`, and `/`.
-`inject.header` is required and `inject.prefix` is prepended to the secret.
+`inject.header` is required, is limited to 256 bytes, and `inject.prefix` is
+prepended to the secret.
 
 Inbound client auth and outbound injection are independent. For Anthropic, for
 example, both can be `x-api-key` with an empty prefix; for an API whose SDK
@@ -234,6 +250,7 @@ not change the binding revision.
 policies:
   github-read:
     service: github
+    capability_summary: Read approved repository metadata, contents, issues, and named GraphQL queries.
     body_limit: 1048576
     cel_cost_limit: 10000
     cel_timeout: 10ms
@@ -243,6 +260,7 @@ policies:
 | Field | Required/default | Meaning |
 |---|---|---|
 | `service` | required | The one service whose relative requests this policy can authorize. |
+| `capability_summary` | empty | Optional one-line, agent-facing description of the policy's useful scope; at most 512 UTF-8 bytes. It is advisory, not executable policy. |
 | `body_limit` | 1 MiB | Maximum body supplied to JSON, GraphQL, or CEL policy inspection. |
 | `cel_cost_limit` | 10000 | Per-expression CEL runtime cost ceiling. |
 | `cel_timeout` | `10ms` | Per-expression CEL evaluation deadline. |
@@ -254,6 +272,16 @@ grant ceiling before policy evaluation. Streaming request uploads are therefore
 not supported in v1. Non-empty `Content-Encoding` other than `identity`, an
 invalid/duplicate `Content-Type`, and trailers present before or after body
 reading fail closed.
+
+`capability_summary` is included in the policy revision, so changing it makes
+tokens carrying the previous revision fail closed unless that revision remains
+available. Keep it concise and faithful to the actual rules. It appears in
+agent context and must never contain a bearer, provider credential, secret
+reference, private upstream, other sensitive value, control character, or
+bidirectional/formatting control. Configuration compilation also proves that
+the largest possible 64-service projection from all current services and
+policies fits the 128 KiB manifest bound, including worst-case delegated
+numeric ceilings.
 
 Rule order has no meaning. Each rule is a conjunction: every configured matcher
 group in that rule must match. Within `methods` and `paths`, any listed member
@@ -414,8 +442,8 @@ roles:
           max_request_bytes: 1048576
 ```
 
-Every role must contain at least one grant and no more than one grant for a
-given service. Credential and policy must both belong to that service. A grant's
+Every role must contain 1--64 grants and no more than one grant for a given
+service. Credential and policy must both belong to that service. A grant's
 `max_request_bytes` may not exceed the server ceiling. `burst` requires a
 nonzero rate, and configured rate/burst values may not exceed 1,000,000.
 
@@ -440,6 +468,6 @@ charged against `byte_budget` in v1.
 [examples/forcefield.yaml](../examples/forcefield.yaml) combines TLS/mTLS,
 `agent-secret`, REST/query rules, JSON and CEL bounds, GraphQL allowlisting,
 deny-wins overlap, separate credentials, and roles. Replace all marked paths,
-certificate files, identity assumptions, approved model placeholders, and
-review the pinned upstream API versions before use. Then run `ff check` and
-adversarial tests.
+the advertised origin, certificate files, identity assumptions, approved model
+placeholders, and review the pinned upstream API versions before use. Then run
+`ff check` and adversarial tests.

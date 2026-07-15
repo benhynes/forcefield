@@ -46,20 +46,23 @@ type Options struct {
 }
 
 type Gateway struct {
-	config      *config.Compiled
-	tokens      TokenValidator
-	secrets     secrets.Backend
-	audit       Auditor
-	services    map[string]*runtimeService
-	credentials map[string]*runtimeCredential
-	pathRoutes  []pathRoute
-	hostRoutes  map[string]*runtimeService
-	limits      *limitManager
-	workload    WorkloadResolver
-	errorLog    *log.Logger
-	transports  map[string]http.RoundTripper
-	requestSeed string
-	requestSeq  atomic.Uint64
+	config           *config.Compiled
+	tokens           TokenValidator
+	secrets          secrets.Backend
+	audit            Auditor
+	services         map[string]*runtimeService
+	credentials      map[string]*runtimeCredential
+	capabilities     *HeaderAdapter
+	pathRoutes       []pathRoute
+	hostRoutes       map[string]*runtimeService
+	limits           *limitManager
+	discoveryLimits  *limitManager
+	discoveryDenials *limitManager
+	workload         WorkloadResolver
+	errorLog         *log.Logger
+	transports       map[string]http.RoundTripper
+	requestSeed      string
+	requestSeq       atomic.Uint64
 }
 
 type runtimeService struct {
@@ -99,9 +102,18 @@ func New(compiled *config.Compiled, validator TokenValidator, backend secrets.Ba
 		config: compiled, tokens: validator, secrets: backend, audit: auditor,
 		services: make(map[string]*runtimeService), credentials: make(map[string]*runtimeCredential),
 		hostRoutes: make(map[string]*runtimeService), limits: newLimitManager(),
+		discoveryLimits: newLimitManager(), discoveryDenials: newLimitManager(),
 		workload: opts.ResolveWorkload, errorLog: opts.ErrorLog,
 		transports: opts.Transports,
 	}
+	capabilityAdapter, err := NewHeaderAdapter(HeaderAdapterConfig{
+		ClientHeader: "Authorization", ClientPrefix: "Bearer ",
+		UpstreamHeader: "Authorization", UpstreamPrefix: "Bearer ",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("capability adapter: %w", err)
+	}
+	g.capabilities = capabilityAdapter
 	var requestSeed [8]byte
 	if _, err := rand.Read(requestSeed[:]); err != nil {
 		return nil, errors.New("initialize request correlation IDs")
@@ -192,6 +204,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	pathDigest := sha256.Sum256([]byte(canonical.Path))
 	metadata.PathHash = hex.EncodeToString(pathDigest[:])
+	if canonical.Path == config.CapabilitiesPath {
+		g.serveCapabilities(w, r, canonical, started, metadata)
+		return
+	}
 	service, relativePath := g.route(r.Host, canonical.Path)
 	if service == nil {
 		g.deny(w)
@@ -229,9 +245,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	grantID := config.GrantID(grant)
 	credential := g.credentials[grant.CredentialRef]
-	compiledPolicy, policyOK := g.config.PoliciesByRevision[grant.PolicyRevision]
+	compiledPolicy, policyOK := g.config.ResolveGrant(grant)
 	if credential == nil || credential.service != service.name || credential.bindingRevision == "" ||
-		grant.BindingRevision != credential.bindingRevision || !policyOK || compiledPolicy.Service != service.name {
+		grant.BindingRevision != credential.bindingRevision || !policyOK {
 		g.recordDeny(started, metadata, service.name, workload, grantID, http.StatusNotFound, 0)
 		g.deny(w)
 		return

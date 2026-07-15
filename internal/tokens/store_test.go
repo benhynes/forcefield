@@ -105,6 +105,18 @@ func delegate(t *testing.T, store *Store, parent IssuedToken, caller, child stri
 	return issued
 }
 
+func TestContainsBearerOnlyMatchesCanonicalEmbeddedToken(t *testing.T) {
+	bearer := BearerPrefix + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, tokenBytes))
+	if len(bearer) != BearerLength || !ContainsBearer("prefix "+bearer+" suffix") {
+		t.Fatal("embedded canonical bearer was not detected")
+	}
+	for _, value := range []string{"ff_", "documentation mentions ff_tokens", bearer[:len(bearer)-1] + "!", strings.Repeat("x", 100)} {
+		if ContainsBearer(value) {
+			t.Fatalf("non-bearer %q was detected", value)
+		}
+	}
+}
+
 func TestMintValidateAndPersistHashedOnly(t *testing.T) {
 	clk := &clock{now: testNow}
 	store, path := openTestStore(t, Options{Now: clk.Now})
