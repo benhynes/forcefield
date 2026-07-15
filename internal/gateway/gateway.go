@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -26,6 +28,7 @@ import (
 	"github.com/benhynes/forcefield/internal/policy"
 	"github.com/benhynes/forcefield/internal/secrets"
 	"github.com/benhynes/forcefield/internal/tokens"
+	"golang.org/x/crypto/ssh"
 )
 
 type TokenValidator interface {
@@ -44,26 +47,36 @@ type Options struct {
 	// Transports is a test/integration seam. Production callers should leave it
 	// empty so every service receives a hardened resolve-once transport.
 	Transports map[string]http.RoundTripper
+	// SSHHostSigner is a test seam for the SSH server nested inside authorized
+	// HTTPS streams. Production callers leave it nil and receive a fresh
+	// process-local Ed25519 host key authenticated by the outer TLS channel.
+	SSHHostSigner ssh.Signer
+	// SSHHandshakeTimeout is a test seam for the guest-side SSH handshake.
+	// Production callers leave it zero and receive the fixed, short default.
+	SSHHandshakeTimeout time.Duration
 }
 
 type Gateway struct {
-	config           *config.Compiled
-	tokens           TokenValidator
-	secrets          secrets.Backend
-	audit            Auditor
-	services         map[string]*runtimeService
-	credentials      map[string]*runtimeCredential
-	capabilities     *HeaderAdapter
-	pathRoutes       []pathRoute
-	hostRoutes       map[string]*runtimeService
-	limits           *limitManager
-	discoveryLimits  *limitManager
-	discoveryDenials *limitManager
-	workload         WorkloadResolver
-	errorLog         *log.Logger
-	transports       map[string]http.RoundTripper
-	requestSeed      string
-	requestSeq       atomic.Uint64
+	config              *config.Compiled
+	tokens              TokenValidator
+	secrets             secrets.Backend
+	audit               Auditor
+	services            map[string]*runtimeService
+	credentials         map[string]*runtimeCredential
+	capabilities        *HeaderAdapter
+	pathRoutes          []pathRoute
+	hostRoutes          map[string]*runtimeService
+	limits              *limitManager
+	discoveryLimits     *limitManager
+	discoveryDenials    *limitManager
+	workload            WorkloadResolver
+	errorLog            *log.Logger
+	transports          map[string]http.RoundTripper
+	requestSeed         string
+	requestSeq          atomic.Uint64
+	sshHostSigner       ssh.Signer
+	sshHandshakeTimeout time.Duration
+	sshConcurrency      *sshConcurrencyManager
 }
 
 type runtimeService struct {
@@ -76,6 +89,8 @@ type runtimeService struct {
 	extractor         *HeaderAdapter
 	transport         http.RoundTripper
 	guard             ResponseGuard
+	ssh               *config.SSHServiceConfig
+	sshDialer         *safeDialer
 }
 
 type runtimeCredential struct {
@@ -107,7 +122,7 @@ func New(compiled *config.Compiled, validator TokenValidator, backend secrets.Ba
 		hostRoutes: make(map[string]*runtimeService), limits: newLimitManager(),
 		discoveryLimits: newLimitManager(), discoveryDenials: newLimitManager(),
 		workload: opts.ResolveWorkload, errorLog: opts.ErrorLog,
-		transports: opts.Transports,
+		transports: opts.Transports, sshConcurrency: newSSHConcurrencyManager(),
 	}
 	capabilityAdapter, err := NewHeaderAdapter(HeaderAdapterConfig{
 		ClientHeader: "Authorization", ClientPrefix: "Bearer ",
@@ -122,10 +137,39 @@ func New(compiled *config.Compiled, validator TokenValidator, backend secrets.Ba
 		return nil, errors.New("initialize request correlation IDs")
 	}
 	g.requestSeed = hex.EncodeToString(requestSeed[:])
+	if hasSSHService(compiled) {
+		g.sshHandshakeTimeout = opts.SSHHandshakeTimeout
+		if g.sshHandshakeTimeout == 0 {
+			g.sshHandshakeTimeout = defaultSSHGuestHandshakeTimeout
+		}
+		if g.sshHandshakeTimeout < time.Second || g.sshHandshakeTimeout > 30*time.Second {
+			return nil, errors.New("SSH guest handshake timeout must be between 1s and 30s")
+		}
+		g.sshHostSigner = opts.SSHHostSigner
+		if g.sshHostSigner == nil {
+			_, privateKey, keyErr := ed25519.GenerateKey(rand.Reader)
+			if keyErr != nil {
+				return nil, errors.New("initialize SSH stream host key")
+			}
+			g.sshHostSigner, keyErr = ssh.NewSignerFromKey(privateKey)
+			if keyErr != nil {
+				return nil, errors.New("initialize SSH stream host signer")
+			}
+		}
+	}
 	if err := g.compileRuntime(); err != nil {
 		return nil, err
 	}
 	return g, nil
+}
+
+func hasSSHService(compiled *config.Compiled) bool {
+	for _, service := range compiled.File.Services {
+		if service.Adapter == config.AdapterSSHSession {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) compileRuntime() error {
@@ -137,13 +181,19 @@ func (g *Gateway) compileRuntime() error {
 		if err != nil {
 			return fmt.Errorf("service %s client adapter: %w", name, err)
 		}
-		transport := g.transports[name]
-		if transport == nil {
-			transport, err = NewHardenedTransport(TransportOptions{
-				AllowedCIDRs: g.config.AllowedPrefixes[name], PinnedSPKISHA256: serviceConfig.PinnedSPKISHA256,
-			})
-			if err != nil {
-				return fmt.Errorf("service %s transport: %w", name, err)
+		var transport http.RoundTripper
+		var sshDialer *safeDialer
+		if serviceConfig.Adapter == config.AdapterSSHSession {
+			sshDialer = &safeDialer{resolver: net.DefaultResolver, allowed: append([]netip.Prefix(nil), g.config.AllowedPrefixes[name]...), timeout: serviceConfig.SSH.ConnectTimeout.Value()}
+		} else {
+			transport = g.transports[name]
+			if transport == nil {
+				transport, err = NewHardenedTransport(TransportOptions{
+					AllowedCIDRs: g.config.AllowedPrefixes[name], PinnedSPKISHA256: serviceConfig.PinnedSPKISHA256,
+				})
+				if err != nil {
+					return fmt.Errorf("service %s transport: %w", name, err)
+				}
 			}
 		}
 		requireIdentity := true
@@ -157,6 +207,7 @@ func (g *Gateway) compileRuntime() error {
 				Upstream: g.config.Upstreams[name], PublicPathPrefix: serviceConfig.PathPrefix,
 				StripHeaders: serviceConfig.Response.StripHeaders, RequireIdentity: requireIdentity,
 			},
+			ssh: serviceConfig.SSH, sshDialer: sshDialer,
 		}
 		if serviceConfig.Git != nil {
 			service.gitRepositoryCase = serviceConfig.Git.RepositoryCase
@@ -173,14 +224,18 @@ func (g *Gateway) compileRuntime() error {
 
 	for name, credentialConfig := range g.config.File.Credentials {
 		serviceConfig := g.config.File.Services[credentialConfig.Service]
-		adapter, err := NewHeaderAdapter(HeaderAdapterConfig{
-			ClientHeader: serviceConfig.ClientAuth.Header, ClientPrefix: serviceConfig.ClientAuth.Prefix,
-			UpstreamHeader: credentialConfig.Inject.Header, UpstreamPrefix: credentialConfig.Inject.Prefix,
-			UpstreamBasicUsername: credentialConfig.BasicUsername,
-			ForwardHeaders:        serviceConfig.ForwardHeaders, StaticHeaders: serviceConfig.StaticHeaders,
-		})
-		if err != nil {
-			return fmt.Errorf("credential %s adapter: %w", name, err)
+		var adapter *HeaderAdapter
+		var err error
+		if serviceConfig.Adapter != config.AdapterSSHSession {
+			adapter, err = NewHeaderAdapter(HeaderAdapterConfig{
+				ClientHeader: serviceConfig.ClientAuth.Header, ClientPrefix: serviceConfig.ClientAuth.Prefix,
+				UpstreamHeader: credentialConfig.Inject.Header, UpstreamPrefix: credentialConfig.Inject.Prefix,
+				UpstreamBasicUsername: credentialConfig.BasicUsername,
+				ForwardHeaders:        serviceConfig.ForwardHeaders, StaticHeaders: serviceConfig.StaticHeaders,
+			})
+			if err != nil {
+				return fmt.Errorf("credential %s adapter: %w", name, err)
+			}
 		}
 		g.credentials[name] = &runtimeCredential{
 			name: name, service: credentialConfig.Service, ref: credentialConfig.SecretRef,
@@ -222,6 +277,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if service.adapter == config.AdapterGitSmartHTTP {
 		g.serveGit(w, r, canonical, service, relativePath, started, metadata)
+		return
+	}
+	if service.adapter == config.AdapterSSHSession {
+		g.serveSSH(w, r, canonical, service, relativePath, started, metadata)
 		return
 	}
 

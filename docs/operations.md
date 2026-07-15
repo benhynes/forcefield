@@ -12,14 +12,16 @@ ff revoke   --config FILE --token-id TOKEN_ID
 ff identity --ip ADDRESS | --cert CLIENT_CERT
 ff capabilities --url ORIGIN --token-file FILE [connection options]
 ff mcp      --url ORIGIN --token-file FILE [connection options]
+ff ssh      [connection options] SERVICE [-- COMMAND ...]
 ff version
 ```
 
 All administrative commands load and validate the config to discover the Unix
 admin socket. They must run as the same trusted host user as `ff serve`. Do not
 expose that socket into a VM or run untrusted agents under that host account.
-`capabilities` and `mcp` are guest-side data-plane clients: they do not load the
-server config or use the admin socket.
+`capabilities`, `mcp`, and `ssh` are guest-side data-plane clients: they do not
+load the server config or use the admin socket. `ssh` resolves a granted alias
+through capability discovery and opens only that advertised terminating route.
 
 ## Prepare the host
 
@@ -50,6 +52,7 @@ Install and populate the credential helper before starting. For the
 agent-secret set GITHUB_READ_TOKEN
 agent-secret set OPENAI_API_KEY
 agent-secret set ANTHROPIC_API_KEY
+agent-secret set INFRA_SHELL_SSH_PRIVATE_KEY
 
 /usr/local/bin/agent-secret get GITHUB_READ_TOKEN >/dev/null
 ```
@@ -64,10 +67,11 @@ ff check --config /etc/forcefield/forcefield.yaml
 ```
 
 `check` verifies config-file type/ownership/mode, schema, object references,
-route uniqueness/canonicalization, header and SPKI-pin syntax, upstream
-URL/CIDR inputs, policy compilation, and configured bounds. It does not stat
-the exec helper, open state, bind a socket, resolve an upstream, perform TLS, or
-retrieve a secret; `serve` can still fail those runtime checks.
+route uniqueness/canonicalization, header, TLS SPKI-pin, and SSH host-key-pin
+syntax, upstream URL/CIDR inputs, policy compilation, and configured bounds. It
+does not stat the exec helper, open state, bind a socket, resolve an upstream,
+perform TLS or SSH handshakes, or retrieve a secret; `serve` can still fail
+those runtime checks.
 
 ## Start and stop
 
@@ -218,6 +222,37 @@ config on stdin or an already-scoped agent environment rather than a literal
 command argument. This protects the `ff_` capability; the real provider secret
 never appears in the client command.
 
+For a granted SSH alias, keep the bearer in its protected file and use the
+guest client instead of placing it on a command line:
+
+```sh
+ff ssh \
+  --url https://forcefield.internal:7902 \
+  --token-file /run/forcefield/token \
+  --ca-cert /run/forcefield/ca.crt \
+  infra-shell
+```
+
+Verify both a permitted shell/exec path and denied forwarding, agent, X11,
+environment, and subsystem requests before granting a live account. Host-key
+pin mismatch and most SSH authorization/upstream failures are deliberately
+reported as opaque connection failures.
+
+Prefer a direct TLS/mTLS route for SSH sessions. If a reverse proxy is
+unavoidable, verify that it supports unbuffered simultaneous request/response
+streaming for HTTP/1.1 chunked or HTTP/2, preferably HTTP/2 over TLS;
+request-body buffering will break the session. Also account for the workload
+identity it exposes to Forcefield: TLS termination removes the original client
+certificate, and ordinary proxying makes the proxy the direct source-IP peer.
+
+Use a unique login key for each Forcefield service/target. On the target, apply
+an sshd `Match User` block and compatible `authorized_keys` restrictions such
+as a Forcefield-host `from=` constraint and disabled forwarding/agent/X11
+features. Give the account only intended filesystem and sudo access, and use
+firewall or namespace egress controls. Forcefield's protocol-level forwarding
+denials do not stop an allowed shell command from opening its own network
+connections.
+
 Expected data-plane failures intentionally reveal little:
 
 - Unknown route/auth/token/workload/grant commonly returns generic 404.
@@ -276,11 +311,13 @@ Revocation is persisted atomically and cascades through all descendants.
 Repeating revocation of an existing token is idempotent. An unknown/malformed
 ID is reported as a rejected control request.
 
-Revocation stops future Forcefield validation. It does not cancel an upstream
-request already in progress, revoke the provider credential, remove a token
-copy from a guest, or terminate the workload. For an incident, also stop the
-workload, rotate the provider credential, and review Forcefield and provider
-audit logs.
+Revocation stops future Forcefield validation. It does not cancel an ordinary
+HTTP/Git upstream request already in progress, revoke the provider credential,
+remove a token copy from a guest, or terminate the workload. Active SSH
+sessions revalidate once per second and close both SSH legs after revocation,
+but that cannot undo completed actions or reliably stop a deliberately detached
+target process. For an incident, also stop the workload, rotate the provider or
+SSH credential, and review Forcefield and provider/target audit logs.
 
 ## Audit records
 
@@ -353,6 +390,10 @@ and strict decoding rejects invented `mode` or `shadow_policy` fields.
 - Treat the audit log as sensitive metadata.
 - Rotate provider credentials in the credential helper. Account for
   `secrets.cache_ttl`; restart or wait before assuming old material is gone.
+- Rotate each service/target's unique SSH login key through the same helper and
+  remove the old public key from the target. For a target host-key change,
+  verify the new fingerprint independently, overlap old/new pins during a
+  bounded rollout, restart and re-mint, then remove the old pin.
 - Rotate mTLS workload keys, mint for the new SPKI identity, then revoke the old
   token tree.
 - Changing `server.audience` invalidates all existing tokens after restart.

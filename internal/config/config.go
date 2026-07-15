@@ -38,8 +38,11 @@ const (
 	// AdapterHTTP is the default request/policy adapter used by existing API
 	// services. AdapterGitSmartHTTP exposes only Git's smart-HTTP fetch and push
 	// protocol surface; repository and ref authority is supplied by policy.
+	// AdapterSSHSession terminates an SSH connection inside an authenticated
+	// HTTPS stream and opens one pinned, host-authenticated upstream session.
 	AdapterHTTP         = "http"
 	AdapterGitSmartHTTP = "git-smart-http"
+	AdapterSSHSession   = "ssh-session"
 
 	// CapabilitiesPath is reserved by the data plane for live, authenticated
 	// discovery of the calling token's sanitized grants. Configured path routes
@@ -51,6 +54,10 @@ const (
 	CapabilityManifestMaxServices = 64
 	CapabilityServiceURLMaxBytes  = 4096
 	CapabilityAuthHeaderMaxBytes  = 256
+
+	SSHStreamProtocolHeader = "X-Forcefield-SSH-Protocol"
+	SSHStreamHostKeyHeader  = "X-Forcefield-SSH-Host-Key-SHA256"
+	SSHStreamProtocol       = "1"
 
 	// BindingEngineRevision is part of every credential binding digest. Bump it
 	// whenever routing, transport, header, response-guard, or other authority
@@ -120,6 +127,7 @@ type SecretBackendConfig struct {
 type ServiceConfig struct {
 	Adapter               string            `json:"adapter,omitempty" yaml:"adapter,omitempty"`
 	Git                   *GitServiceConfig `json:"git,omitempty" yaml:"git,omitempty"`
+	SSH                   *SSHServiceConfig `json:"ssh,omitempty" yaml:"ssh,omitempty"`
 	Upstream              string            `json:"upstream" yaml:"upstream"`
 	PathPrefix            string            `json:"path_prefix,omitempty" yaml:"path_prefix,omitempty"`
 	Host                  string            `json:"host,omitempty" yaml:"host,omitempty"`
@@ -134,6 +142,15 @@ type ServiceConfig struct {
 
 type GitServiceConfig struct {
 	RepositoryCase gitadapter.RepositoryCaseMode `json:"repository_case" yaml:"repository_case"`
+}
+
+// SSHServiceConfig pins every upstream SSH authority input. The target and
+// user never come from the guest. HostKeySHA256 uses OpenSSH's SHA256:...
+// public-key fingerprint form.
+type SSHServiceConfig struct {
+	User           string   `json:"user" yaml:"user"`
+	HostKeySHA256  []string `json:"host_key_sha256" yaml:"host_key_sha256"`
+	ConnectTimeout Duration `json:"connect_timeout,omitempty" yaml:"connect_timeout,omitempty"`
 }
 
 type HeaderAuth struct {
@@ -161,6 +178,17 @@ type PolicyConfig struct {
 	CELTimeout        Duration          `json:"cel_timeout,omitempty" yaml:"cel_timeout,omitempty"`
 	Rules             []policy.RuleSpec `json:"rules,omitempty" yaml:"rules,omitempty"`
 	Git               *GitPolicyConfig  `json:"git,omitempty" yaml:"git,omitempty"`
+	SSH               *SSHPolicyConfig  `json:"ssh,omitempty" yaml:"ssh,omitempty"`
+}
+
+// SSHPolicyConfig controls only SSH session protocol features. Once Shell or
+// Exec is allowed, the pinned Unix account remains the real command authority;
+// Forcefield does not claim to parse shell-language semantics.
+type SSHPolicyConfig struct {
+	AllowShell         bool     `json:"allow_shell,omitempty" yaml:"allow_shell,omitempty"`
+	AllowExec          bool     `json:"allow_exec,omitempty" yaml:"allow_exec,omitempty"`
+	AllowPTY           bool     `json:"allow_pty,omitempty" yaml:"allow_pty,omitempty"`
+	MaxSessionDuration Duration `json:"max_session_duration" yaml:"max_session_duration"`
 }
 
 // GitPolicyConfig is intentionally separate from the generic HTTP policy
@@ -213,6 +241,7 @@ type CompiledPolicy struct {
 	CapabilitySummary string
 	Policy            *policy.Policy
 	GitPolicy         *gitadapter.Policy
+	SSHPolicy         *SSHPolicyConfig
 }
 
 // CapabilityProjection is the immutable, agent-visible portion of one
@@ -222,6 +251,15 @@ type CapabilityProjection struct {
 	Service, Adapter, BaseURL, PathPrefix, Host string
 	ClientHeader, ClientPrefix                  string
 	CapabilitySummary                           string
+	SSH                                         *SSHCapabilityProjection
+}
+
+// SSHCapabilityProjection is the intentionally small, agent-visible portion
+// of an SSH policy. Target, user, host-key pins, and credential references stay
+// exclusively in the trusted gateway configuration.
+type SSHCapabilityProjection struct {
+	AllowShell, AllowExec, AllowPTY bool
+	MaxSessionDuration              Duration
 }
 
 type Compiled struct {
@@ -365,8 +403,13 @@ func applyDefaults(file *File) {
 	for name, service := range file.Services {
 		if service.Adapter == "" {
 			service.Adapter = AdapterHTTP
-			file.Services[name] = service
 		}
+		if service.SSH != nil {
+			if service.SSH.ConnectTimeout == 0 {
+				service.SSH.ConnectTimeout = Duration(5 * time.Second)
+			}
+		}
+		file.Services[name] = service
 	}
 }
 
@@ -453,6 +496,76 @@ func validateSecretBackend(secret SecretBackendConfig) error {
 	return nil
 }
 
+func validateSSHService(name string, service ServiceConfig) error {
+	if service.SSH == nil || service.Git != nil {
+		return invalid("service " + name + " ssh-session requires ssh settings")
+	}
+	if service.AllowInsecureUpstream || len(service.PinnedSPKISHA256) != 0 || len(service.ForwardHeaders) != 0 ||
+		len(service.StaticHeaders) != 0 || len(service.Response.StripHeaders) != 0 || service.Response.RequireIdentity != nil {
+		return invalid("service " + name + " ssh-session contains HTTP-only settings")
+	}
+	if !validSSHUser(service.SSH.User) {
+		return invalid("service " + name + " has an invalid SSH user")
+	}
+	if len(service.SSH.HostKeySHA256) == 0 || len(service.SSH.HostKeySHA256) > 8 {
+		return invalid("service " + name + " has an invalid SSH host-key fingerprint")
+	}
+	seenPins := make(map[string]struct{}, len(service.SSH.HostKeySHA256))
+	for _, fingerprint := range service.SSH.HostKeySHA256 {
+		if !validSSHHostKeyFingerprint(fingerprint) {
+			return invalid("service " + name + " has an invalid SSH host-key fingerprint")
+		}
+		if _, duplicate := seenPins[fingerprint]; duplicate {
+			return invalid("service " + name + " has duplicate SSH host-key fingerprints")
+		}
+		seenPins[fingerprint] = struct{}{}
+	}
+	if service.SSH.ConnectTimeout.Value() < time.Second || service.SSH.ConnectTimeout.Value() > 30*time.Second {
+		return invalid("service " + name + " SSH connect_timeout must be between 1s and 30s")
+	}
+	if service.ClientAuth.Header != "" && (!strings.EqualFold(service.ClientAuth.Header, "Authorization") || service.ClientAuth.Prefix != "Bearer ") {
+		return invalid("service " + name + " ssh-session client_auth must be Authorization Bearer")
+	}
+	return nil
+}
+
+func validSSHUser(value string) bool {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value || !utf8.ValidString(value) || tokens.ContainsBearer(value) {
+		return false
+	}
+	for _, current := range value {
+		if unicode.IsControl(current) || unicode.IsSpace(current) || unicode.Is(unicode.Cf, current) || unicode.Is(unicode.Zl, current) || unicode.Is(unicode.Zp, current) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSSHHostKeyFingerprint(value string) bool {
+	if !strings.HasPrefix(value, "SHA256:") {
+		return false
+	}
+	encoded := strings.TrimPrefix(value, "SHA256:")
+	raw, err := base64.RawStdEncoding.DecodeString(encoded)
+	return err == nil && len(raw) == sha256.Size && base64.RawStdEncoding.EncodeToString(raw) == encoded
+}
+
+func validUpstreamHostPort(upstream *url.URL) bool {
+	if upstream == nil || upstream.Hostname() == "" {
+		return false
+	}
+	host := upstream.Hostname()
+	if net.ParseIP(host) == nil && !validHostname(strings.ToLower(host)) {
+		return false
+	}
+	port := upstream.Port()
+	if port == "" {
+		return false
+	}
+	number, err := strconv.Atoi(port)
+	return err == nil && number > 0 && number <= 65535 && strconv.Itoa(number) == port
+}
+
 func compileServices(compiled *Compiled) error {
 	if len(compiled.File.Services) == 0 {
 		return invalid("at least one service is required")
@@ -463,29 +576,46 @@ func compileServices(compiled *Compiled) error {
 		if !validID(name) {
 			return invalid("invalid service name " + name)
 		}
-		if service.Adapter != AdapterHTTP && service.Adapter != AdapterGitSmartHTTP {
+		if service.Adapter != AdapterHTTP && service.Adapter != AdapterGitSmartHTTP && service.Adapter != AdapterSSHSession {
 			return invalid("service " + name + " has an unsupported adapter")
 		}
-		if service.Adapter == AdapterHTTP && service.Git != nil {
-			return invalid("service " + name + " cannot use git settings with the HTTP adapter")
+		if service.Adapter == AdapterHTTP && (service.Git != nil || service.SSH != nil) {
+			return invalid("service " + name + " cannot use adapter-specific settings with the HTTP adapter")
 		}
 		if service.Adapter == AdapterGitSmartHTTP {
-			if service.Git == nil {
+			if service.Git == nil || service.SSH != nil {
 				return invalid("service " + name + " git-smart-http requires git.repository_case")
 			}
 			if _, err := gitadapter.NormalizeRepository("repository.git", service.Git.RepositoryCase); err != nil {
 				return invalid("service " + name + " has an invalid git.repository_case")
 			}
 		}
+		if service.Adapter == AdapterSSHSession {
+			if err := validateSSHService(name, service); err != nil {
+				return err
+			}
+			if compiled.File.Server.AdvertisedBaseURL == "" {
+				return invalid("service " + name + " ssh-session requires server.advertised_base_url")
+			}
+		}
 		upstream, err := url.Parse(service.Upstream)
 		if err != nil || upstream.Host == "" || upstream.User != nil || upstream.RawQuery != "" || upstream.ForceQuery || upstream.Fragment != "" {
 			return invalid("service " + name + " has invalid upstream")
 		}
-		if upstream.Scheme != "https" && !(service.AllowInsecureUpstream && upstream.Scheme == "http") {
-			return invalid("service " + name + " upstream must use HTTPS")
-		}
-		if upstream.Scheme == "http" && len(service.PinnedSPKISHA256) != 0 {
-			return invalid("service " + name + " cannot use SPKI pins with HTTP")
+		if service.Adapter == AdapterSSHSession {
+			if upstream.Scheme != "ssh" || upstream.Path != "" || upstream.RawPath != "" {
+				return invalid("service " + name + " SSH upstream must be an ssh:// host with no path")
+			}
+			if !validUpstreamHostPort(upstream) {
+				return invalid("service " + name + " has invalid SSH upstream host or port")
+			}
+		} else {
+			if upstream.Scheme != "https" && !(service.AllowInsecureUpstream && upstream.Scheme == "http") {
+				return invalid("service " + name + " upstream must use HTTPS")
+			}
+			if upstream.Scheme == "http" && len(service.PinnedSPKISHA256) != 0 {
+				return invalid("service " + name + " cannot use SPKI pins with HTTP")
+			}
 		}
 		if (service.PathPrefix == "") == (service.Host == "") {
 			return invalid("service " + name + " needs exactly one of path_prefix or host")
@@ -528,10 +658,12 @@ func compileServices(compiled *Compiled) error {
 		if !validAuthHeader(service.ClientAuth) {
 			return invalid("service " + name + " client_auth.header is required")
 		}
-		if service.Adapter == AdapterGitSmartHTTP {
+		if service.Adapter == AdapterGitSmartHTTP || service.Adapter == AdapterSSHSession {
 			if !strings.EqualFold(service.ClientAuth.Header, "Authorization") || service.ClientAuth.Prefix != "Bearer " {
-				return invalid("service " + name + " git-smart-http client_auth must be Authorization Bearer")
+				return invalid("service " + name + " adapter client_auth must be Authorization Bearer")
 			}
+		}
+		if service.Adapter == AdapterGitSmartHTTP {
 			if service.Response.RequireIdentity != nil && !*service.Response.RequireIdentity {
 				return invalid("service " + name + " git-smart-http requires identity responses")
 			}
@@ -586,15 +718,17 @@ func compileServices(compiled *Compiled) error {
 			}
 			prefixes = append(prefixes, prefix.Masked())
 		}
-		canonicalBase, err := policy.CanonicalPath(upstream.EscapedPath())
-		if err != nil {
-			return invalid("service " + name + " has a non-canonical upstream path")
+		if service.Adapter != AdapterSSHSession {
+			canonicalBase, err := policy.CanonicalPath(upstream.EscapedPath())
+			if err != nil {
+				return invalid("service " + name + " has a non-canonical upstream path")
+			}
+			upstream.Path, err = url.PathUnescape(canonicalBase)
+			if err != nil {
+				return invalid("service " + name + " has an invalid upstream path")
+			}
+			upstream.RawPath = canonicalBase
 		}
-		upstream.Path, err = url.PathUnescape(canonicalBase)
-		if err != nil {
-			return invalid("service " + name + " has an invalid upstream path")
-		}
-		upstream.RawPath = canonicalBase
 		compiled.Upstreams[name] = upstream
 		compiled.AllowedPrefixes[name] = prefixes
 		advertisedURL := advertisedServiceURL(compiled.File.Server.AdvertisedBaseURL, service)
@@ -638,16 +772,25 @@ func compileCredentials(compiled *Compiled) error {
 		return invalid("at least one credential is required")
 	}
 	for name, credential := range compiled.File.Credentials {
-		if !validID(name) || !validSecretReference(credential.SecretRef, compiled.File.Secrets.Type == "env") || !validAuthHeader(credential.Inject) {
+		if !validID(name) || !validSecretReference(credential.SecretRef, compiled.File.Secrets.Type == "env") {
 			return invalid("invalid credential " + name)
-		}
-		if credential.BasicUsername != "" && (!strings.EqualFold(credential.Inject.Header, "Authorization") || credential.Inject.Prefix != "" || !validBasicUsername(credential.BasicUsername)) {
-			return invalid("credential " + name + " has an invalid basic_username injection")
 		}
 		if _, exists := compiled.File.Services[credential.Service]; !exists {
 			return invalid("credential " + name + " references unknown service")
 		}
 		service := compiled.File.Services[credential.Service]
+		if service.Adapter == AdapterSSHSession {
+			if credential.Inject != (HeaderAuth{}) || credential.BasicUsername != "" {
+				return invalid("credential " + name + " ssh-session credential must contain only service and secret_ref")
+			}
+		} else {
+			if !validAuthHeader(credential.Inject) {
+				return invalid("invalid credential " + name)
+			}
+			if credential.BasicUsername != "" && (!strings.EqualFold(credential.Inject.Header, "Authorization") || credential.Inject.Prefix != "" || !validBasicUsername(credential.BasicUsername)) {
+				return invalid("credential " + name + " has an invalid basic_username injection")
+			}
+		}
 		if strings.EqualFold(credential.Inject.Header, service.ClientAuth.Header) {
 			// Replacing the carrier is the normal case and remains allowed.
 		} else {
@@ -696,8 +839,8 @@ func compilePolicies(compiled *Compiled) error {
 		var err error
 		switch adapter {
 		case AdapterHTTP:
-			if spec.Git != nil {
-				return invalid("policy " + name + " cannot use git rules with the HTTP adapter")
+			if spec.Git != nil || spec.SSH != nil {
+				return invalid("policy " + name + " cannot use adapter-specific rules with the HTTP adapter")
 			}
 			entry.Policy, err = policy.Compile(policy.Spec{Rules: spec.Rules}, policy.Options{
 				BodyLimit: spec.BodyLimit, CELCostLimit: spec.CELCostLimit, CELTimeout: spec.CELTimeout.Value(),
@@ -710,13 +853,26 @@ func compilePolicies(compiled *Compiled) error {
 			}
 			entry.Revision, err = policyRevision(spec, entry.Policy)
 		case AdapterGitSmartHTTP:
-			if spec.Git == nil || len(spec.Rules) != 0 || spec.BodyLimit != 0 || spec.CELCostLimit != 0 || spec.CELTimeout != 0 {
+			if spec.Git == nil || spec.SSH != nil || len(spec.Rules) != 0 || spec.BodyLimit != 0 || spec.CELCostLimit != 0 || spec.CELTimeout != 0 {
 				return invalid("policy " + name + " must use only git rules with the git-smart-http adapter")
 			}
 			entry.GitPolicy, err = compileGitPolicy(*spec.Git, compiled.File.Services[spec.Service].Git.RepositoryCase)
 			if err == nil {
 				entry.Revision, err = gitPolicyRevision(spec, compiled.File.Services[spec.Service].Git.RepositoryCase)
 			}
+		case AdapterSSHSession:
+			if spec.SSH == nil || spec.Git != nil || len(spec.Rules) != 0 || spec.BodyLimit != 0 || spec.CELCostLimit != 0 || spec.CELTimeout != 0 {
+				return invalid("policy " + name + " must use only ssh rules with the ssh-session adapter")
+			}
+			if spec.CapabilitySummary == "" || !spec.SSH.AllowShell && !spec.SSH.AllowExec {
+				return invalid("policy " + name + " SSH policy requires a capability summary and shell or exec")
+			}
+			if spec.SSH.MaxSessionDuration.Value() < time.Second || spec.SSH.MaxSessionDuration.Value() > 24*time.Hour {
+				return invalid("policy " + name + " SSH max_session_duration must be between 1s and 24h")
+			}
+			sshPolicy := *spec.SSH
+			entry.SSHPolicy = &sshPolicy
+			entry.Revision, err = sshPolicyRevision(spec)
 		default:
 			err = errors.New("unsupported adapter")
 		}
@@ -798,6 +954,15 @@ func validateCapabilityManifestBound(compiled *Compiled) error {
 		Header string `json:"header"`
 		Prefix string `json:"prefix,omitempty"`
 	}
+	// This mirrors capabilities.SSHCapability exactly. config cannot import the
+	// capabilities package without a cycle, so the bound proof carries the JSON
+	// shape explicitly and an external regression test compares it with Build.
+	type manifestSSH struct {
+		AllowShell         bool   `json:"allow_shell"`
+		AllowExec          bool   `json:"allow_exec"`
+		AllowPTY           bool   `json:"allow_pty"`
+		MaxSessionDuration string `json:"max_session_duration"`
+	}
 	type manifestService struct {
 		Name              string        `json:"name"`
 		Adapter           string        `json:"adapter"`
@@ -805,6 +970,7 @@ func validateCapabilityManifestBound(compiled *Compiled) error {
 		PathPrefix        string        `json:"path_prefix,omitempty"`
 		Host              string        `json:"host,omitempty"`
 		Auth              manifestAuth  `json:"auth"`
+		SSH               *manifestSSH  `json:"ssh,omitempty"`
 		CapabilitySummary string        `json:"capability_summary,omitempty"`
 		ConfiguredLimits  tokens.Limits `json:"configured_limits,omitempty"`
 	}
@@ -832,6 +998,17 @@ func validateCapabilityManifestBound(compiled *Compiled) error {
 			PathPrefix: projection.PathPrefix, Host: projection.Host,
 			Auth:              manifestAuth{Header: http.CanonicalHeaderKey(projection.ClientHeader), Prefix: projection.ClientPrefix},
 			CapabilitySummary: policyEntry.CapabilitySummary, ConfiguredLimits: longestLimits,
+		}
+		if policyEntry.Adapter == AdapterSSHSession {
+			if policyEntry.SSHPolicy == nil {
+				return invalid("policy " + policyEntry.Name + " has no SSH capability projection")
+			}
+			candidate.SSH = &manifestSSH{
+				AllowShell:         policyEntry.SSHPolicy.AllowShell,
+				AllowExec:          policyEntry.SSHPolicy.AllowExec,
+				AllowPTY:           policyEntry.SSHPolicy.AllowPTY,
+				MaxSessionDuration: policyEntry.SSHPolicy.MaxSessionDuration.Value().String(),
+			}
 		}
 		encoded, err := json.Marshal(candidate)
 		if err != nil {
@@ -945,6 +1122,29 @@ func bindingRevision(compiled *Compiled, credentialName string, credential Crede
 		}
 		digest = sha256.Sum256(encoded)
 	}
+	if service.Adapter == AdapterSSHSession {
+		hostKeys := append([]string(nil), service.SSH.HostKeySHA256...)
+		sort.Strings(hostKeys)
+		sshMaterial := struct {
+			Engine, Adapter, User, CredentialFormat string
+			HostKeySHA256                           []string
+			ConnectTimeout                          Duration
+			SingleSessionChannel                    bool
+			Forwarding, Agent, X11, Environment     bool
+			Subsystems                              bool
+			Base                                    [sha256.Size]byte
+		}{
+			Engine: "forcefield-binding-ssh-session/v1", Adapter: service.Adapter,
+			User: service.SSH.User, CredentialFormat: "unencrypted-private-key",
+			HostKeySHA256: hostKeys, ConnectTimeout: service.SSH.ConnectTimeout,
+			SingleSessionChannel: true, Base: digest,
+		}
+		encoded, err = json.Marshal(sshMaterial)
+		if err != nil {
+			return "", err
+		}
+		digest = sha256.Sum256(encoded)
+	}
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
@@ -976,6 +1176,25 @@ func policyRevision(spec PolicyConfig, compiled *policy.Policy) (string, error) 
 	}{
 		Engine: policy.EngineRevision, Service: spec.Service, CapabilitySummary: spec.CapabilitySummary,
 		Options: compiled.EffectiveOptions(), Rules: canonicalPolicyRules(spec.Rules),
+	}
+	encoded, err := json.Marshal(material)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func sshPolicyRevision(spec PolicyConfig) (string, error) {
+	material := struct {
+		Engine, Service, CapabilitySummary string
+		AllowShell, AllowExec, AllowPTY    bool
+		MaxSessionDuration                 Duration
+	}{
+		Engine: "forcefield-ssh-policy/v1", Service: spec.Service,
+		CapabilitySummary: spec.CapabilitySummary,
+		AllowShell:        spec.SSH.AllowShell, AllowExec: spec.SSH.AllowExec, AllowPTY: spec.SSH.AllowPTY,
+		MaxSessionDuration: spec.SSH.MaxSessionDuration,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -1225,6 +1444,17 @@ func (compiled *Compiled) ResolveCapabilityGrant(grant tokens.Grant) (Capability
 		return CapabilityProjection{}, false
 	}
 	projection.CapabilitySummary = policyEntry.CapabilitySummary
+	if policyEntry.Adapter == AdapterSSHSession {
+		if policyEntry.SSHPolicy == nil {
+			return CapabilityProjection{}, false
+		}
+		projection.SSH = &SSHCapabilityProjection{
+			AllowShell:         policyEntry.SSHPolicy.AllowShell,
+			AllowExec:          policyEntry.SSHPolicy.AllowExec,
+			AllowPTY:           policyEntry.SSHPolicy.AllowPTY,
+			MaxSessionDuration: policyEntry.SSHPolicy.MaxSessionDuration,
+		}
+	}
 	return projection, true
 }
 

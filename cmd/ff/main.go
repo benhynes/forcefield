@@ -34,9 +34,33 @@ var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "ff: %v\n", err)
-		os.Exit(1)
+		exitCode, silent := commandExitBehavior(err)
+		if !silent {
+			_, _ = fmt.Fprintf(os.Stderr, "ff: %v\n", err)
+		}
+		os.Exit(exitCode)
 	}
+}
+
+type controlledExit interface {
+	error
+	ExitCode() int
+	Silent() bool
+}
+
+func commandExitBehavior(err error) (code int, silent bool) {
+	if err == nil {
+		return 0, true
+	}
+	var controlled controlledExit
+	if errors.As(err, &controlled) {
+		code = controlled.ExitCode()
+		if code < 1 || code > 255 {
+			code = 255
+		}
+		return code, controlled.Silent()
+	}
+	return 1, false
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -63,6 +87,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runMCP(args[1:], stdin, stdout)
 	case "git-credential":
 		return runGitCredential(args[1:], stdin, stdout)
+	case "ssh":
+		return runSSH(args[1:], stdin, stdout, stderr)
 	case "version", "--version", "-version":
 		_, err := fmt.Fprintln(stdout, version)
 		return err
@@ -456,6 +482,7 @@ Usage:
   ff capabilities --url FORCEFIELD_ORIGIN [--format text|json|claude-hook|codex-hook]
   ff mcp --url FORCEFIELD_ORIGIN [--token-file PATH]
   ff git-credential --url FORCEFIELD_GIT_URL --token-file PATH get|store|erase
+  ff ssh [options] SERVICE [-- COMMAND ...]
   ff version
 `)
 }

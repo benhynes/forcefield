@@ -2,15 +2,17 @@
 
 Forcefield (`ff`) is a default-deny credential capability gateway for
 untrusted agents. An agent receives a short-lived `ff_...` token and calls an
-HTTP API or Git smart-HTTP endpoint. Forcefield binds that token to a workload,
-evaluates the canonical request against an immutable grant, fetches the real
-credential on the host, replaces the broker token with that credential, and
-calls one pinned upstream.
+HTTP API, Git smart-HTTP endpoint, or pinned SSH-session route. Forcefield
+binds that token to a workload, evaluates the canonical request against an
+immutable grant, fetches the real credential on the host, and either injects
+HTTP/Git authentication or authenticates independently to one pinned SSH
+upstream.
 
-The agent can exercise only the authority in its grant; the upstream API key or
-Git password does not enter the VM. Forcefield supports header-authenticated
-APIs and an explicit Git smart-HTTP adapter. It is not a general forward proxy,
-TLS MITM, or universal replacement for provider-specific authentication.
+The agent can exercise only the authority in its grant; the upstream API key,
+Git password, or SSH private key does not enter the VM. Forcefield supports
+header-authenticated APIs plus explicit Git smart-HTTP and terminating SSH
+session adapters. It is not a general forward proxy, TLS MITM, or universal
+replacement for provider-specific authentication.
 
 ```text
 agent / VM                  trusted host                    upstream
@@ -18,8 +20,9 @@ agent / VM                  trusted host                    upstream
 ff_ token + request  --->   route -> identity -> token
                             -> limits -> deny-wins policy
                             -> audit -> fetch credential
-                            -> replace auth header       ---> pinned API
-                      <---  guard response              <--- response
+                            -> inject HTTP/Git auth      ---> pinned API
+                            -> or terminate SSH          ---> pinned SSH host
+                      <---  guard/relay response         <--- response
 
 operator CLI  ----------->  same-user Unix admin socket
                             mint / delegate / revoke
@@ -90,13 +93,13 @@ for a TLS-only `agent-secret` configuration.
 ## How authority is structured
 
 - A **service** defines an adapter, one pinned upstream, one public route, the
-  inbound token header, forwarded-header allowlist, operator-pinned static
-  protocol headers, transport restrictions, and response guard.
-- A **credential** attaches a host-side secret reference and outbound injection
-  header to exactly one service.
-- A **policy** attaches either deny-wins HTTP/query/JSON/GraphQL/CEL rules or
-  Git repository/ref rules to exactly one service. No matching allow means
-  deny.
+  inbound token carrier, transport restrictions, and adapter-specific protocol
+  settings.
+- A **credential** attaches a host-side secret reference and adapter-specific
+  upstream authentication mechanism to exactly one service.
+- A **policy** attaches deny-wins HTTP/query/JSON/GraphQL/CEL rules, Git
+  repository/ref rules, or SSH shell/exec/PTY permissions to exactly one
+  service. No matching HTTP/Git allow means deny.
 - A **grant** is the concrete tuple of service, credential, policy revision,
   security-binding revision, and resource ceilings.
 - A **role** is an operator template used only when minting. Tokens contain
@@ -111,7 +114,7 @@ old tokens fail closed after restart unless the old revision remains available.
 - [Architecture](docs/architecture.md)
 - [Configuration and policy reference](docs/configuration.md)
 - [Operating: start, mint, use, delegate, revoke, and roll out policy](docs/operations.md)
-- [Client recipes: curl, OpenAI, Anthropic, and Git](docs/client-recipes.md)
+- [Client recipes: curl, OpenAI, Anthropic, Git, and SSH](docs/client-recipes.md)
 - [Automatic agent capability awareness: live manifest, Claude/Codex hooks, and MCP](docs/agent-awareness.md)
 - [Threat model and residual risks](docs/threat-model.md)
 
@@ -123,6 +126,11 @@ old tokens fail closed after restart unless the old revision remains available.
 - Git smart-HTTP clone/fetch/push with repository and per-ref policy
 - Explicit case-sensitive or ASCII-insensitive Git repository identity
 - A path-scoped Git credential helper that reads a delivered `ff_` token file
+- Terminating SSH sessions to a pinned host, port, user, and host key via
+  `ff ssh`, with the upstream private key retained on the trusted host
+- SSH session expiry/revocation checks, decoded input and allowed protocol
+  request-payload accounting, and unconditional rejection of SSH forwarding,
+  agent/X11, environment, and subsystems
 - Path-prefix or host-based reverse-proxy routes
 - Source-IP or verified-client-certificate workload binding
 - `agent-secret` and other no-shell exec credential helpers
@@ -140,8 +148,8 @@ old tokens fail closed after restart unless the old revision remains available.
 - Generic CONNECT/forward proxying, arbitrary destinations, WebSockets, or HTTP
   upgrades
 - Client-certificate credentials to upstreams
-- SSH credentials or raw SSH tunneling (a future adapter should issue
-  short-lived SSH certificates or a constrained `ProxyCommand`)
+- SSH certificates, SFTP/subsystems, agent/X11/port forwarding, arbitrary SSH
+  destinations, and raw TCP tunneling
 - Runtime config reload, runtime shadow-policy evaluation, or an observe mode
 - Request-body rewriting or provider-semantic approval workflows
 
@@ -159,6 +167,16 @@ For Git, repository authorization is over the configured URL identity and each
 wire-visible ref update. Operators must choose repository case semantics that
 match the upstream and must not let aliases or server-side hooks translate an
 allowed URL/ref into effects on differently authorized repositories or refs.
+
+For SSH, Forcefield terminates an SSH connection inside the already
+authenticated HTTPS route, then authenticates separately to exactly one pinned
+upstream. The target receives the configured login public key and proof-of-key
+signatures, never the private key. Rejected port forwarding, agent, X11,
+environment, and subsystem requests are SSH protocol restrictions; an allowed
+shell or arbitrary exec still has the configured Unix account's filesystem and
+network authority. Forcefield does not interpret shell commands. Target-side
+account, sshd/`authorized_keys`, sudo, filesystem, and egress policy remain
+essential boundaries.
 
 The response guard is defense in depth, not a proof that a hostile upstream can
 never disclose a credential. It catches the exact credential in headers or a

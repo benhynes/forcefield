@@ -44,10 +44,10 @@ contain only lowercase letters, digits, `-`, or `_` (maximum 128 characters).
 | `client_ca` | optional | PEM CA pool for required verified client certificates; requires server TLS. |
 | `allow_insecure_ingress` | `false` | Allows plaintext on a non-loopback listener. Development/isolated networks only. |
 | `read_header_timeout` | `5s` | Inbound HTTP header timeout. |
-| `read_timeout` | `30s` | Inbound request-read deadline. |
+| `read_timeout` | `30s` | Inbound request-read deadline; an authorized SSH stream replaces it with the exact earlier-of-token/policy session deadline. |
 | `idle_timeout` | `60s` | Inbound idle connection timeout. |
 | `max_token_ttl` | `24h` | Maximum TTL accepted by mint and delegate; must be from 1 second through 168 hours. |
-| `max_request_bytes` | 16 MiB | Enforced global request-body ceiling and upper bound for policy/grant ceilings; from 1 byte through 1 GiB. |
+| `max_request_bytes` | 16 MiB | Enforced global HTTP/Git request-body ceiling and SSH counted-input ceiling, and upper bound for policy/grant ceilings; from 1 byte through 1 GiB. |
 
 TLS minimum version is 1.2. When `client_ca` is set, clients must present a
 certificate chaining to that pool. When it is absent, the workload identity is
@@ -175,9 +175,12 @@ services:
 
 | Field | Required/default | Meaning |
 |---|---|---|
-| `adapter` | `http` | Request/policy adapter: `http` or `git-smart-http`. |
+| `adapter` | `http` | Request/policy adapter: `http`, `git-smart-http`, or `ssh-session`. |
 | `git.repository_case` | required for Git | Repository URL identity mode: `sensitive` or `ascii-insensitive`. Invalid on the HTTP adapter. |
-| `upstream` | required | Fixed absolute HTTP(S) base. No userinfo, query, or fragment. HTTPS is required by default. |
+| `ssh.user` | required for SSH | Fixed upstream SSH username; never selected by the guest. |
+| `ssh.host_key_sha256` | required for SSH | One to eight exact OpenSSH `SHA256:` host-key fingerprints, allowing overlap during rotation. |
+| `ssh.connect_timeout` | `5s` | SSH-only TCP and upstream-handshake timeout, from 1 through 30 seconds. |
+| `upstream` | required | Fixed absolute HTTP(S) base, or `ssh://host:port` for SSH. No userinfo, query, or fragment; SSH also forbids a path and requires an explicit port. |
 | `path_prefix` | exactly one route | Public path route such as `/github`; at most 4096 bytes and not `/`, trailing `/`, repeated slash, unsafe display controls, or embedded bearer material. Longest matching prefix wins. When an advertised origin is configured, the derived service URL must also fit the 4096-byte manifest field. |
 | `host` | exactly one route | Exact lowercase DNS hostname route instead of a path prefix. IP literals and trailing dots are invalid. |
 | `allow_insecure_upstream` | `false` | Allows a configured `http` upstream. Never use for production credentials. |
@@ -202,6 +205,13 @@ be an ancestor of that path.
 SPKI pins are the standard-base64 SHA-256 digest of certificate
 SubjectPublicKeyInfo, not hex and not a certificate fingerprint. Plan for pin
 overlap during rotation.
+
+An `ssh-session` service requires `server.advertised_base_url` because `ff ssh`
+resolves the alias through authenticated capability discovery before opening
+the stream. SSH uses the same path/host route and an `Authorization` header
+with the exact `Bearer ` prefix on the outer HTTPS data plane. HTTP-only forwarding, static
+header, SPKI, insecure-upstream, and response fields are invalid on this
+adapter.
 
 Static and forwarded header names may not overlap. Static headers also cannot
 be the client-token or injected-credential carrier, `Host`, `Accept-Encoding`,
@@ -278,6 +288,57 @@ prefix is removed first, so a public clone URL for the example is
 `https://forcefield.example/git/owner/repository.git`. Dumb Git HTTP endpoints,
 Git LFS endpoints, and hosting-provider REST APIs do not share this adapter.
 
+### SSH session services
+
+An SSH service is a terminating broker, not a TCP forwarder. The guest opens an
+inner SSH connection over the service's authenticated HTTPS stream. Forcefield
+then uses a host-side private key to authenticate independently to one fixed
+upstream:
+
+```yaml
+services:
+  infra-box:
+    adapter: ssh-session
+    upstream: ssh://10.200.4.20:22
+    path_prefix: /ssh/infra-box
+    allowed_cidrs: [10.200.4.0/24]
+    client_auth: {header: Authorization, prefix: "Bearer "}
+    ssh:
+      user: ops
+      host_key_sha256:
+        - SHA256:REPLACE_WITH_VERIFIED_UNPADDED_BASE64
+      connect_timeout: 5s
+```
+
+The target address, port, username, host-key pins, and private-key reference
+are operator configuration and never appear in the capability manifest or
+come from the guest. Verify host-key fingerprints through an independent
+trusted channel before configuring them. Multiple pins support deliberate key
+rotation; normal SSH `known_hosts` discovery and trust-on-first-use are not
+used.
+
+The adapter accepts one `session` channel. It unconditionally rejects direct
+and remote port forwarding, agent and X11 forwarding, environment requests,
+subsystems (including SFTP), tunnel channels, and additional session channels.
+Shell, exec, and PTY are separately enabled by policy. The HTTPS workload
+identity remains the existing source-IP or verified mTLS identity; the inner
+SSH username is a fixed protocol value and conveys no authority.
+
+Those denials constrain SSH protocol features, not commands run inside an
+allowed shell or exec session. The configured Unix account can still read or
+write whatever its filesystem permissions allow and make whatever network
+connections the target permits. Enforce finer boundaries with the target
+account, sshd and `authorized_keys`, sudoers, filesystem/namespaces, and egress
+policy.
+
+The guest-side SSH handshake must complete within 10 seconds, or sooner if the
+token/policy deadline arrives first. A reverse proxy in front of this route must
+support unbuffered, simultaneous request and response streaming. The wire form
+is HTTP/1.1 chunked or HTTP/2; prefer HTTP/2 over TLS when proxying. A proxy that
+buffers the request body cannot carry the session, and terminating mTLS or
+changing the direct peer also changes the workload identity Forcefield can
+authenticate.
+
 ## `credentials`
 
 ```yaml
@@ -294,13 +355,34 @@ Each credential belongs to exactly one service. `secret_ref` is passed verbatim
 as the final helper argument (or appended to `env_prefix` for the env backend).
 References are at most 512 bytes; the env backend accepts only letters, digits,
 and underscore, while exec also accepts non-leading `.`, `-`, `:`, and `/`.
-`inject.header` is required, is limited to 256 bytes, and `inject.prefix` is
-prepended to the secret.
+For HTTP and Git credentials, `inject.header` is required and limited to 256
+bytes, and `inject.prefix` is prepended to the secret.
 
-Inbound client auth and outbound injection are independent. For Anthropic, for
-example, both can be `x-api-key` with an empty prefix; for an API whose SDK
-expects a bearer token while the upstream expects a different header, configure
-those separately.
+For `ssh-session`, omit both `inject` and `basic_username`; the secret must be
+an unencrypted PEM or OpenSSH private key accepted by Go's SSH parser:
+
+```yaml
+credentials:
+  infra-box-key:
+    service: infra-box
+    secret_ref: INFRA_BOX_SSH_PRIVATE_KEY
+```
+
+The key bytes are fetched only after grant authorization and the fail-closed
+audit boundary, parsed on the trusted host, and never sent to the guest or
+upstream. Public-key authentication necessarily sends the login public key and
+proof-of-key signatures to the target; private-key bytes remain on the
+Forcefield host. Login keys and target host keys use Go's supported
+non-insecure SSH algorithms. RSA login or host keys must be at least 2048 bits,
+and RSA login authentication permits only RSA-SHA2-256/512, not legacy
+`ssh-rsa`/SHA-1. Encrypted private keys and passphrase references are not
+supported in v1. Prefer a unique login key for each Forcefield service/target
+instead of reusing a key across accounts or machines.
+
+For HTTP and Git, inbound client auth and outbound injection are independent.
+For Anthropic, for example, both can be `x-api-key` with an empty prefix; for an
+API whose SDK expects a bearer token while the upstream expects a different
+header, configure those separately.
 
 For an upstream that treats a token as an HTTP Basic password, configure an
 otherwise empty-prefix `Authorization` injection plus `basic_username`:
@@ -336,8 +418,8 @@ not change the binding revision.
 
 Policy syntax is selected by the service adapter. An `http` service uses the
 existing `rules`, body, GraphQL, and CEL fields. A `git-smart-http` service uses
-only the nested `git.rules` schema described below; mixing the two languages is
-rejected.
+only nested `git.rules`; `ssh-session` uses only nested `ssh` permissions.
+Mixing adapter policy languages is rejected.
 
 ```yaml
 policies:
@@ -359,6 +441,10 @@ policies:
 | `cel_timeout` | `10ms` | HTTP adapter only: per-expression CEL evaluation deadline. |
 | `rules` | HTTP adapter only; may be empty | Compiled HTTP rules. Empty means deny every request. |
 | `git.rules` | Git adapter only; 1--256 | Compiled repository/ref rules. |
+| `ssh.allow_shell` | SSH adapter only | Permit an interactive/default shell on the pinned account. |
+| `ssh.allow_exec` | SSH adapter only | Permit arbitrary SSH exec command strings on the pinned account. |
+| `ssh.allow_pty` | SSH adapter only | Permit PTY allocation; shell or exec must also be allowed. |
+| `ssh.max_session_duration` | required for SSH | Hard session ceiling from 1 second through 24 hours, further bounded by token expiry. |
 
 For the HTTP adapter, `body_limit` may not exceed
 `server.max_request_bytes`. Every body is buffered under the smallest
@@ -519,6 +605,34 @@ binary CEL `double`. A lossy value such as `0.1` therefore fails that CEL
 evaluation closed rather than being silently rounded. JSON pointer matchers
 continue to compare numbers by exact mathematical value.
 
+## SSH session policies
+
+```yaml
+policies:
+  infra-box-shell:
+    service: infra-box
+    capability_summary: Full shell and arbitrary command execution as the configured account; SSH protocol forwarding/subsystems are disabled, but account filesystem/network authority remains.
+    ssh:
+      allow_shell: true
+      allow_exec: true
+      allow_pty: true
+      max_session_duration: 30m
+```
+
+An SSH policy must have a non-empty `capability_summary`, must allow shell or
+exec, and must set a finite duration. `allow_exec` is arbitrary command
+execution, not a command allowlist: on ordinary SSH servers it is effectively
+shell-level authority. Forcefield deliberately does not parse quoting, shell
+syntax, sudo, or target-side command effects. Use a dedicated Unix account,
+restricted sudoers rules, filesystem permissions, namespaces, and egress
+policy for finer authority.
+
+The hard deadline is the earlier of token expiry and
+`max_session_duration`. Forcefield revalidates the concrete token/grant once
+per second and closes both SSH legs after revocation or revision invalidation.
+This bounds continued access but cannot undo completed actions or guarantee
+that a process deliberately detached on the target exits with the connection.
+
 ## Git smart-HTTP policies
 
 Git policy is provider- and branch-name-neutral. This example permits fetches
@@ -652,10 +766,16 @@ For rate and aggregate budgets, `0` means unlimited:
 - `requests_per_second`: token-bucket refill rate.
 - `burst`: bucket capacity; defaults to 1 when a rate is set and burst is zero.
 - `request_budget`: aggregate request attempts for the root token/grant.
-- `byte_budget`: aggregate client-to-upstream request body bytes only. For a
-  gzip-encoded Git RPC, this counts decoded bytes forwarded upstream.
+- `byte_budget`: aggregate client-to-upstream counted input bytes. For HTTP it
+  is request-body bytes; for a gzip-encoded Git RPC, it is decoded bytes
+  forwarded upstream. For SSH, it is decoded session-channel input plus the raw
+  payload bytes of allowed session requests actually forwarded upstream (such
+  as exec, PTY, window-change, signal, and break). It excludes HTTP/SSH framing
+  and encryption overhead, rejected request payloads, and replies.
 - `max_request_bytes`: per-request body ceiling; `0` in a role inherits the
-  finite `server.max_request_bytes` rather than becoming unlimited.
+  finite `server.max_request_bytes` rather than becoming unlimited. For SSH it
+  is the per-session ceiling over those same counted input and forwarded
+  request-payload bytes.
 
 Every request is charged atomically against the corresponding concrete grant at
 each token in its root-to-leaf delegation chain. An ancestor therefore bounds
@@ -664,12 +784,22 @@ siblings. State is kept in memory and reset on server restart. A request can
 consume request budget before a later body or policy denial. Responses are not
 charged against `byte_budget` in v1.
 
+An SSH tunnel admission counts as one request/rate-budget use. In addition to
+configured grant limits, the process admits at most 128 concurrent SSH
+sessions, 16 per workload, and 8 per token. These hard bounds are availability
+controls, not additional authority. Each session also has a hard SSH protocol
+request guard: 64 requests per second with burst 128 and 4096 total. Channel
+opens and global/session request attempts count toward that guard even when
+rejected; rejected payload bytes do not count toward `byte_budget` or
+`max_request_bytes`.
+
 ## Production example
 
 [examples/forcefield.yaml](../examples/forcefield.yaml) combines TLS/mTLS,
 `agent-secret`, REST/query rules, JSON and CEL bounds, GraphQL allowlisting, a
 generic Git smart-HTTP policy, deny-wins overlap, separate credentials, and
-roles. Replace all marked paths, origins, certificate files, identity
-assumptions, repository namespaces, approved model placeholders, and review
-the pinned upstream API versions before use. Then run `ff check` and
+roles, plus a deliberately non-working pinned SSH-session target. Replace all
+marked paths, origins, certificate files, identity assumptions, repository
+namespaces, SSH target/account/key/pin values, approved model placeholders, and
+review the pinned upstream API versions before use. Then run `ff check` and
 adversarial tests.

@@ -24,6 +24,10 @@ upstream response.
 - Malformed Git smart-HTTP routes, pkt-line framing, object IDs, ref names,
   duplicate or mixed-authority ref updates, compressed packs, and attempts to
   smuggle an unauthorized update inside a multi-ref push.
+- SSH attempts to select a different target/user, bypass a host-key pin, open
+  extra session or forwarding channels, request agent/X11/environment/subsystem
+  features, exceed decoded channel/request-payload limits, or continue after
+  expiry/revocation.
 - An agent attempting to enumerate routes, token validity, grants, or policy
   failures.
 - A secret backend failure, policy evaluation error, audit failure, malformed
@@ -36,9 +40,9 @@ upstream response.
 - The Forcefield host, its kernel, its operator account, the binary, config,
   state directory, CA keys, and credential helper are trusted. Host compromise
   defeats the system.
-- The configured upstream and its TLS endpoint are trusted not to intentionally
-  transform and disclose the credential. Forcefield detects only exact
-  reflection.
+- The configured upstream and its TLS or pinned SSH endpoint are trusted. An
+  HTTP/Git upstream is trusted not to intentionally transform and disclose the
+  credential; Forcefield detects only exact reflection.
 - Provider credentials are independently scoped as narrowly as the provider
   permits. Forcefield is an additional boundary, not a substitute for native
   scope, expiry, spend limits, or provider-side audit.
@@ -51,6 +55,10 @@ upstream response.
 - Availability is not guaranteed against a client authorized to consume its
   request/bandwidth allowance, a large permitted Git pack, or an upstream that
   streams indefinitely.
+- SSH shell or arbitrary exec permission is full authority as the configured
+  target account. Target sudoers, filesystem, service, and egress policy are
+  trusted to supply any finer boundary. Closing a connection cannot undo work
+  or reliably kill a deliberately detached process.
 
 ## Workload authentication
 
@@ -136,11 +144,12 @@ admin socket to the guest integration.
 
 ## Confused-deputy and SSRF controls
 
-The client cannot supply an upstream URL. A route selects a configured HTTPS
-authority. Absolute targets, CONNECT, upgrades, trailers, encoded separators,
-double-encoded octets, dot segments, repeated interior slashes, malformed or
-oversized queries, semicolons in path segments, raw query `+` or semicolons,
-and excessive query pairs are denied.
+The client cannot supply an upstream endpoint. An HTTP/Git route selects a
+configured HTTPS authority, while an SSH route selects its configured
+`ssh://host:port`. Absolute HTTP targets, CONNECT, upgrades, trailers, encoded
+separators, double-encoded octets, dot segments, repeated interior slashes,
+malformed or oversized queries, semicolons in path segments, raw query `+` or
+semicolons, and excessive query pairs are denied.
 
 DNS resolution validates every returned address, then dials one of those exact
 addresses while retaining TLS SNI/certificate validation for the configured
@@ -150,6 +159,12 @@ listed. Outbound proxy environment variables are ignored.
 The Git adapter likewise does not turn a repository path into a destination.
 Its four smart-HTTP route shapes are relative to the service's one configured
 upstream. Dumb HTTP, Git LFS, and provider API paths do not match those shapes.
+
+The SSH adapter similarly ignores every guest-supplied notion of destination.
+It dials the one configured host and explicit port through the same resolve-once
+CIDR guard, verifies an exact configured SSH host-key fingerprint, and uses the
+configured username. It never consults host SSH config, proxy commands, or an
+SSH agent.
 
 Residual risks include compromise of DNS plus a valid certificate, an overly
 broad `allowed_cidrs` exception, a bad configured hostname, a compromised
@@ -184,11 +199,61 @@ Policy still has semantic blind spots:
   confidentiality. Git push rules can prove the repository, full ref, and
   create/update/delete shape of each command, but not whether an update is a
   fast-forward or what the new objects mean.
+- SSH policy controls only shell, arbitrary exec, and PTY protocol modes plus
+  duration. It does not safely parse shell syntax or constrain commands inside
+  an allowed shell/exec session.
 - A provider can assign new semantics to an already allowed endpoint without a
   Forcefield configuration change.
 
 Use purpose-built adapters for high-impact operations where it is important to
 pin fields rather than merely test them.
+
+## SSH session boundary
+
+The guest's SSH connection is nested inside the same authenticated HTTPS data
+plane used for capability calls. The bearer is therefore checked with the
+existing source-IP or verified-mTLS workload identity and is not reused as an
+SSH password. Forcefield terminates that inner connection and separately
+authenticates upstream with a private key fetched after the audit boundary;
+the target receives the configured public key and proof-of-key signatures,
+never private-key bytes.
+
+Only one `session` channel is accepted. Port and stream-local forwarding,
+agent and X11 forwarding, tunnel channels, environment requests, subsystems
+(including SFTP), and extra sessions are rejected independent of policy. The
+process uses only Go's supported non-insecure SSH algorithms. Host-key pinning
+does not rescue an incorrectly configured target or a compromised pinned host.
+RSA login and target host keys must be at least 2048 bits; RSA authentication
+uses RSA-SHA2-256/512 and never legacy `ssh-rsa`/SHA-1.
+
+The hard I/O deadline is the earlier of token expiry and configured policy
+duration, and the guest SSH handshake has its own 10-second ceiling. Active
+sessions revalidate once per second, so revocation has a bounded polling window;
+actions completed during or before that window remain completed. Decoded
+guest-to-target channel input plus payload bytes for allowed session requests
+actually forwarded upstream count against the delegation byte budget and
+per-session ceiling. HTTP/SSH framing, encryption overhead, rejected request
+payloads, and replies do not. Separately, all global/session request and channel
+open attempts, including rejected attempts, have a hard 64-per-second,
+burst-128, 4096-total guard. In-memory admission and byte counters reset on
+process restart like the existing HTTP/Git limit state. Decoded stdout/stderr
+is not scanned for the private key because the upstream never receives that
+key; terminal contents are not audited.
+
+These rejections are SSH protocol controls, not a sandbox around commands. A
+permitted shell or exec can use every filesystem, service, sudo, and network
+capability available to the configured Unix account. Use a unique login key,
+target-side sshd/`authorized_keys` restrictions, a dedicated account, and
+filesystem and egress controls as independent enforcement. A compromised or
+over-privileged target account remains correspondingly powerful.
+
+The outer transport also requires simultaneous unbuffered HTTP request and
+response streaming. Direct TLS/mTLS is preferred. Any reverse proxy must
+support that full-duplex behavior for HTTP/1.1 chunked or HTTP/2, preferably
+HTTP/2 over TLS; a buffering proxy breaks the transport. Proxy TLS termination
+or source-address rewriting also collapses the mTLS or direct-peer workload
+identity unless the deployment provides an equally trusted identity boundary
+outside Forcefield.
 
 ## Git smart-HTTP boundary
 
@@ -334,7 +399,9 @@ Token persistence is crash-conscious and bearer-free. A held cross-process
 lock on supported platforms prevents multiple servers from sharing one token
 file, and inactive records/subtrees are durably pruned on open and mutation.
 The HTTP adapter buffers bodies under a finite configured ceiling; Git
-smart-HTTP streams bounded RPC bodies after semantic prefix authorization.
+smart-HTTP streams bounded RPC bodies after semantic prefix authorization; SSH
+counts decoded guest channel input and allowed forwarded request payloads and
+applies a finite session deadline.
 Numeric budgets and rate state are not persisted and reset on restart. If those
 are hard security quotas, enforce them again at the provider or an external
 durable accounting layer.
@@ -352,6 +419,11 @@ durable accounting layer.
   for ancestry/merge constraints Forcefield cannot infer.
 - Match `git.repository_case` to upstream routing, remove differently
   authorized repository aliases, and audit receive hooks for ref rewrites.
+- For SSH, independently verify host-key pins, use a dedicated minimally
+  privileged Unix account and unique login key, apply target-side
+  sshd/`authorized_keys`, filesystem, sudo, and egress restrictions, test every
+  forwarding/subsystem denial, and keep policy session durations and token TTLs
+  short.
 - Retain old policy revisions during a controlled migration or revoke/re-mint.
 - Keep capability hooks/MCP root-managed and treat injected grant text as
   advisory, never as authorization.

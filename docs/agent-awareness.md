@@ -43,11 +43,28 @@ other denials.
 The JSON response contains a schema version, generation/token-expiry
 timestamps, and a sorted, secret-free projection of revision-current concrete grants:
 service name, adapter, public base URL/route, client authentication convention,
-operator-authored capability summary, and configured grant ceilings. Grants
+operator-authored capability summary, configured grant ceilings, and, for SSH,
+the granted shell/exec/PTY modes plus maximum session duration. Grants
 whose policy or credential binding revision is no longer current are omitted.
 It does not contain the bearer, provider credential, secret reference, private
 upstream URL, token or grant IDs, role name, policy internals, or admin-socket
 information.
+
+Adapter-specific rendering gives agents an exact client recipe without
+exposing private binding details. Git entries show the scoped credential-helper
+command. SSH entries show only recipes supported by the concrete grant: shell,
+command execution, and PTY availability are explicit, and a no-PTY shell recipe
+includes `--no-pty`. They use the public Forcefield origin, service alias, and
+protected token-file path; they do not reveal the target address, Unix username,
+host-key pins, or private-key reference. The same rendering is injected into
+Claude and Codex sessions and returned by the MCP capability tool, so no
+harness-specific SSH prompt is required.
+
+Agent-facing text should describe SSH denials precisely. “No forwarding or
+subsystems” means Forcefield rejects those SSH protocol requests; it does not
+mean a granted shell/exec lacks filesystem or network authority. The policy's
+`capability_summary` should state the configured account's effective scope and
+any target-side restrictions the agent must understand.
 
 Configured ceilings are not remaining quota. The endpoint deliberately does
 not inspect live request/byte counters, and a listed grant may already be

@@ -283,6 +283,65 @@ for the largest intended push. Git LFS, dumb HTTP, push certificates, push
 options, and protocol-v2 push are not supported; use ordinary protocol fallback
 and do not route those other endpoints through this adapter.
 
+## SSH sessions
+
+For a grant whose service uses `adapter: ssh-session`, use the service alias
+from capability discovery. `ff ssh` fetches the live manifest, resolves only
+that named SSH service, then opens the exact advertised route:
+
+```sh
+ff ssh \
+  --url https://forcefield.internal:7902 \
+  --token-file /run/forcefield/token \
+  --ca-cert /run/forcefield/ca.crt \
+  infra-box
+```
+
+When `FORCEFIELD_URL`, `FORCEFIELD_TOKEN_FILE`, and any TLS variables are
+provisioned, the short form is simply:
+
+```sh
+ff ssh infra-box
+ff ssh infra-box -- uname -a
+```
+
+An interactive shell automatically requests a PTY when stdin is a terminal and
+the discovered grant permits PTYs. A shell-only grant without PTY permission
+automatically stays non-PTY. Use `-t`/`--pty` to force a permitted PTY or
+`-T`/`--no-pty` to suppress it. The client rejects unavailable shell, exec, or
+PTY modes locally before opening a broker session. Command arguments are
+joined with spaces like the ordinary SSH CLI; quote a compound remote command
+as one local shell argument when exact grouping matters.
+
+The capability entry reports `allow_shell`, `allow_exec`, `allow_pty`, and the
+configured maximum session duration. Agent-facing recipes are mode-aware: an
+exec-only grant shows only the `-- COMMAND ...` form, while a shell without PTY
+permission includes `--no-pty`.
+
+The `ff_` token authenticates only the outer HTTPS request and remains bound to
+the existing source-IP or mTLS workload. Inside that stream, Forcefield
+terminates a native SSH connection and authenticates independently to the
+pinned upstream with the host-side key. The guest receives neither the key nor
+an SSH agent; the target receives the corresponding public key and
+proof-of-key signatures, never private-key bytes. Port/agent/X11 forwarding,
+environment requests, subsystems, and additional channels are unavailable as
+SSH protocol features. They do not prevent a permitted shell or command from
+using the configured account's filesystem or opening outbound connections
+allowed by target policy. A generic connection failure can mean an
+expired/revoked grant, exhausted limits, a stale policy/binding revision, host
+key mismatch, a 10-second guest-handshake timeout, or an upstream failure.
+
+The HTTPS exchange is full duplex. Connect directly when possible. If the
+Forcefield endpoint is behind a reverse proxy, it must stream request and
+response bodies simultaneously without buffering for HTTP/1.1 chunked or
+HTTP/2; prefer HTTP/2 over TLS. It must also preserve the intended
+workload-authentication boundary.
+
+An accepted remote command's non-zero exit status becomes the `ff` process exit
+status without an extra diagnostic line. Connection and pre-start failures use
+the generic Forcefield connection error and exit status 255; a rejected exec
+request never prints the command text.
+
 ## mTLS from SDKs
 
 SDKs commonly use an HTTP client such as `httpx` underneath. Configure that
@@ -310,9 +369,8 @@ Do not point these at the generic header adapter and assume equivalence:
   explicit adapter support beyond the current Git smart-HTTP surface.
 - Docker/OCI clients follow registry challenge and token-exchange flows across
   multiple authorities.
-- SSH needs a separate adapter that issues a short-lived SSH certificate or a
-  tightly constrained `ProxyCommand` for a pinned host. It must not use the HTTP
-  gateway as a raw TCP tunnel.
+- SSH certificates, arbitrary SSH destinations, SFTP, and raw SSH/TCP
+  forwarding remain outside the terminating `ssh-session` adapter.
 - Clients requiring CONNECT, WebSockets, arbitrary absolute URLs, request-body
   signing, or upstream mTLS need dedicated adapters.
 

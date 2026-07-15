@@ -10,7 +10,7 @@ for that service.
 ```text
 untrusted workload                 Forcefield host
 ------------------                 -----------------------------------
-HTTP client                        public data plane
+HTTP/Git/ff ssh client             public data plane
   ff_ bearer --------------------> route + canonicalize
   request body                     resolve workload (mTLS SPKI or IP)
                                    validate token + concrete grant
@@ -18,16 +18,16 @@ HTTP client                        public data plane
                                    evaluate deny-wins policy
                                    append pre-authority audit record
                                    fetch referenced host secret
-                                   rebuild headers from allowlist
-                                   inject real upstream credential
+                                   rebuild/inject HTTP or Git auth
+                                   or terminate/pin an SSH session
                                                  |
                                                  v
                                       hardened direct transport
-                                      DNS/IP policy + TLS + optional pin
+                                      DNS/IP policy + TLS/SSH identity pins
                                                  |
                                                  v
 trusted, pinned upstream <-----------------------+
-              response ----------> strip/redirect/exact-secret guard
+              response ----------> HTTP guard or SSH channel relay
                                    stream response to workload
 
 trusted operator                    private control plane
@@ -65,17 +65,24 @@ For each request Forcefield performs these operations in order:
    the repository as a whole, while receive-pack parses and authorizes every ref
    update before opening an upstream request. Git pack data then streams under
    the global/grant body and byte ceilings. Late trailers fail closed.
+   The SSH adapter admits one full-duplex stream, applies hard concurrency and
+   session-duration bounds, and treats rate/request budget as tunnel admission.
 7. Append an allow record before any secret is fetched. With the default
    `audit_failure: closed`, an audit error stops the request here. Revalidate
    the immutable token/grant before and after the potentially slow secret lookup.
-8. Resolve the credential reference, create outbound headers only from the
+8. Resolve the credential reference. HTTP/Git create outbound headers only from the
    configured allowlist, add operator-controlled static headers, inject the
    credential with `Set` semantics (or the configured upstream Basic-password
    transform), and send the request using the service's direct hardened
-   transport.
-9. Strip risky response headers, validate or rewrite redirects, scan response
+   transport. SSH parses a private key in host memory, connects only to the
+   configured host/port through the same resolve-once address guard, verifies
+   an exact host-key pin, and authenticates as the configured user.
+9. HTTP/Git strip risky response headers, validate or rewrite redirects, scan response
    headers for the exact secret, reject any non-final status outside 200--599,
    and stream an exact-secret-filtered body.
+   For SSH, terminate the inner connection, accept one session channel, relay
+   only policy-enabled shell/exec/PTY requests, and reject forwarding,
+   environment, and subsystems.
 10. Append completion metadata correlated by request ID, public token ID, and
     root token ID. Data-plane records include method, a SHA-256 path digest,
     policy reason/rule IDs, and sizes, but the audit type cannot hold request
@@ -120,7 +127,7 @@ These are separate because each is a different security decision:
 
 ```text
 service     = adapter + route + pinned upstream + transport + client token carrier
-credential  = service + host secret reference + upstream header injection
+credential  = service + host secret reference + adapter-specific upstream auth
 policy      = service + adapter-specific immutable matcher revision
 binding     = revision of security-relevant service/credential configuration
 grant       = service + credential + policy + binding revisions + ceilings
@@ -131,8 +138,9 @@ token       = workload + audience + expiry + concrete immutable grants
 A role is consulted only by `ff mint`. A minted token does not gain authority
 when a role later changes. A policy's SHA-256 revision includes its service,
 resource bounds, and rules. A separate binding revision covers the upstream,
-route, transport confinement, header/response controls, secret reference and
-injection, secret-backend mapping, global body ceiling, and request-read timeout.
+route, transport confinement, adapter-specific protocol and response controls,
+secret reference/auth interpretation, secret-backend mapping, global body
+ceiling, and request-read timeout.
 Changing either revision makes a token
 fail closed rather than silently changing its authority. Rotating the value
 behind an unchanged secret reference intentionally preserves the binding.
@@ -147,12 +155,13 @@ parent or sibling.
 
 ## Upstream confinement
 
-The upstream URL is parsed at startup and cannot contain user info, a query, or
-a fragment. HTTPS is mandatory unless `allow_insecure_upstream` is explicitly
-set for an HTTP URL. Production configurations should never use that escape
-hatch.
+The upstream endpoint is parsed at startup and cannot contain user info, a
+query, or a fragment. HTTP and Git services require HTTPS unless
+`allow_insecure_upstream` is explicitly set for an HTTP URL. Production
+configurations should never use that escape hatch. SSH services instead require
+a canonical `ssh://host:port` endpoint with an explicit port and no path.
 
-The outbound transport:
+The HTTP/Git outbound transport:
 
 - ignores proxy environment variables;
 - resolves the configured hostname, rejects the connection if any returned
@@ -281,6 +290,62 @@ ordinary clients can fall back to v0, while a v2 receive-pack RPC is denied.
 Push certificates and push options are also denied. These restrictions keep the
 policy input to the command form Forcefield actually parses.
 
+## SSH session adapter
+
+`adapter: ssh-session` carries a native SSH connection inside one authenticated
+full-duplex HTTPS request. The outer layer retains Forcefield's bearer,
+source-IP/mTLS workload identity, route, limits, and fail-closed audit boundary.
+The inner layer is terminated by Forcefield; it never reaches the upstream as
+an opaque TCP tunnel.
+
+After authorization, Forcefield retrieves the configured private key, dials
+the fixed `ssh://host:port` through the resolve-once CIDR guard, verifies one
+of the configured exact host-key fingerprints, and authenticates as the fixed
+upstream user. Only then does it commit HTTP 200 and perform the guest-side SSH
+handshake. The inner process-local host key is pinned by a response header
+authenticated by the outer TLS connection; the guest presents no second
+credential. The `ff_` bearer remains an HTTPS credential and is never sent in
+the SSH protocol. The guest handshake has a 10-second deadline, further bounded
+by token expiry and policy duration.
+
+One tunnel accepts exactly one `session` channel. Structurally validated
+shell, exec, PTY, window-change, break, and signal requests are relayed only
+when the immutable SSH policy permits them. Direct/remote forwarding,
+additional channels, agent and X11 forwarding, environment requests, and
+subsystems are rejected locally. Supported SSH algorithms come from Go's
+non-insecure algorithm set; neither host SSH configuration nor `SSH_AUTH_SOCK`
+is consulted. RSA login and host keys must be at least 2048 bits, and RSA login
+authentication permits RSA-SHA2-256/512 rather than legacy `ssh-rsa`/SHA-1.
+The target sees the configured login public key and signatures proving
+possession, but never receives private-key bytes.
+
+The session deadline is `min(token expiry, policy max_session_duration)` and is
+installed on both SSH legs and the HTTP stream. The same bearer, workload,
+token/root identity, concrete grant, revisions, and delegation limit chain are
+revalidated once per second; failure closes both sides. Decoded guest-to-target
+session-channel input and the raw payload of each allowed session request
+actually forwarded upstream consume the delegation-wide byte budget and
+per-session ceiling. HTTP/SSH framing, encryption overhead, rejected request
+payloads, and replies do not. Independently, channel opens and global/session
+request attempts are capped at 64 per second with burst 128 and 4096 total per
+session, including rejected attempts. Audit records contain metadata and byte
+counts, never command strings or terminal contents.
+
+The outer HTTP exchange must remain full duplex. Direct TLS/mTLS is preferred;
+any reverse proxy must stream request and response bodies simultaneously
+without buffering. Forcefield accepts HTTP/1.1 chunked or HTTP/2 for the stream;
+prefer HTTP/2 over TLS when proxying. A buffering proxy deadlocks the SSH
+transport, while TLS termination or peer-address rewriting also changes the
+workload identity visible to Forcefield.
+
+Shell and arbitrary exec permission are necessarily coarse. Rejected SSH port
+forwarding, agent/X11, environment, and subsystem requests do not prevent a
+shell command from reading files or opening network connections. Once granted,
+the configured Unix account, sshd/`authorized_keys` restrictions, sudoers,
+target filesystem, services, and target egress policy define the real authority.
+Disconnecting cannot undo completed actions or reliably kill a process
+deliberately detached on the target.
+
 ## Response boundary
 
 By default Forcefield removes `Set-Cookie`, `Authentication-Info`,
@@ -325,10 +390,10 @@ adapter:
   registry adapter, not a permissive second destination.
 - **Upstream mTLS:** requires host-side certificate/key selection and a service
   transport adapter. The current TLS settings cover inbound workload mTLS only.
-- **SSH:** is not an HTTP tunnel use case. A future adapter should issue a
-  short-lived SSH certificate or expose a tightly constrained `ProxyCommand`
-  for a pinned host and operation; Forcefield must not become an arbitrary raw
-  TCP tunnel.
+- **Other SSH modes:** the terminating session adapter does not issue SSH
+  certificates, proxy arbitrary destinations, expose SFTP, or provide port,
+  agent, X11, or raw TCP forwarding. Those require separate threat models and
+  must not broaden the existing pinned session boundary.
 - **High-impact operations:** when method/path/body filtering cannot express a
   safe boundary, expose a narrow semantic operation that pins non-overridable
   fields instead of transparently proxying the provider API.

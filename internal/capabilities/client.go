@@ -190,13 +190,24 @@ func capabilityTransport(options ClientOptions) (http.RoundTripper, error) {
 		}
 		tlsConfig.Certificates = []tls.Certificate{certificate}
 	}
+	responseTimeout := options.Timeout
+	if responseTimeout < time.Second || responseTimeout > 30*time.Second {
+		responseTimeout = 5 * time.Second
+	}
 	return &http.Transport{
 		Proxy: nil, DisableCompression: true, ForceAttemptHTTP2: true,
 		DialContext:     (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSClientConfig: tlsConfig, TLSHandshakeTimeout: 5 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second, IdleConnTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: responseTimeout, IdleConnTimeout: 30 * time.Second,
 		MaxResponseHeaderBytes: 32 << 10,
 	}, nil
+}
+
+// NewTransport constructs the same direct-only TLS/mTLS transport used by
+// capability discovery for another Forcefield client protocol. It never uses
+// environment proxy settings and never disables certificate verification.
+func NewTransport(options ClientOptions) (http.RoundTripper, error) {
+	return capabilityTransport(options)
 }
 
 func readBearerFile(path string) (string, error) {

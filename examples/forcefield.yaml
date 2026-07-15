@@ -1,6 +1,6 @@
 # Production-oriented template. It is safe by default for LLM writes because
 # model allowlists are non-working placeholders. Replace paths, advertised and
-# Git origins, repository namespaces, PKI, upstream credential scopes, approved
+# Git/SSH targets, repository namespaces, PKI, upstream credential scopes, approved
 # models, and tested upstream API-version pins for your environment.
 version: 1
 
@@ -32,7 +32,7 @@ secrets:
   command: /usr/local/bin/agent-secret
   args: [get]
   timeout: 5s
-  # Credential values are header-bound and capped at 16 KiB.
+  # Header credentials and SSH private-key documents are capped at 16 KiB.
   max_output_bytes: 16384
   cache_ttl: 30s
   max_cache_entries: 32
@@ -74,6 +74,22 @@ services:
     response:
       require_identity: true
 
+  infra-shell:
+    # Terminating SSH session broker. Replace the target, CIDR, account, and
+    # independently verified host-key fingerprint before minting this role.
+    adapter: ssh-session
+    upstream: ssh://infra.internal:22
+    path_prefix: /ssh/infra-shell
+    allowed_cidrs: [10.200.4.0/24]
+    client_auth:
+      header: Authorization
+      prefix: "Bearer "
+    ssh:
+      user: forcefield-agent
+      # This all-zero digest is a deliberately non-working placeholder.
+      host_key_sha256: [SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA]
+      connect_timeout: 5s
+
   openai:
     # The SDK appends /responses to this upstream base path.
     upstream: https://api.openai.com/v1
@@ -113,6 +129,12 @@ credentials:
     # Optional transform for upstreams that accept a token as a Basic password.
     # Omit this and configure inject.prefix if the upstream expects Bearer/token.
     basic_username: broker
+
+  infra-shell-key:
+    service: infra-shell
+    # Use a unique target login key for this service/account. The target sees
+    # its public key and signatures, while private-key bytes remain host-side.
+    secret_ref: INFRA_SHELL_SSH_PRIVATE_KEY
 
   openai-project:
     service: openai
@@ -219,6 +241,18 @@ policies:
           repositories: [engineering/infrastructure.git]
           refs: [refs/heads/stable]
 
+  infra-shell:
+    service: infra-shell
+    # SSH protocol forwarding/subsystems are denied, but commands retain this
+    # account's filesystem and target-network authority. Restrict both at the
+    # target with sshd/authorized_keys, account policy, and egress controls.
+    capability_summary: Full shell and arbitrary command execution as the configured account; SSH protocol forwarding/subsystems are disabled, but account filesystem/network authority remains.
+    ssh:
+      allow_shell: true
+      allow_exec: true
+      allow_pty: true
+      max_session_duration: 30m
+
   openai-bounded:
     service: openai
     capability_summary: Create non-stored Responses with an operator-approved model and at most 2048 output tokens.
@@ -305,6 +339,18 @@ roles:
           request_budget: 5000
           byte_budget: 1073741824
           max_request_bytes: 134217728
+
+  infra-operator:
+    grants:
+      - service: infra-shell
+        credential: infra-shell-key
+        policy: infra-shell
+        limits:
+          requests_per_second: 1
+          burst: 2
+          request_budget: 100
+          byte_budget: 10485760
+          max_request_bytes: 10485760
 
   openai-agent:
     grants:

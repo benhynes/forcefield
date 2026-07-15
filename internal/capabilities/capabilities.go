@@ -22,6 +22,9 @@ import (
 )
 
 const (
+	// SSH adds an adapter-specific block without changing v1 HTTP/Git entries.
+	// Older clients already fail closed on the new ssh-session adapter value,
+	// while their HTTP/Git-only manifests remain byte-schema compatible.
 	SchemaVersion       = 1
 	MaxManifestSize     = config.CapabilityManifestMaxBytes
 	MaxContextBytes     = 9_000
@@ -38,14 +41,24 @@ type Manifest struct {
 }
 
 type Service struct {
-	Name              string `json:"name"`
-	Adapter           string `json:"adapter"`
-	BaseURL           string `json:"base_url,omitempty"`
-	PathPrefix        string `json:"path_prefix,omitempty"`
-	Host              string `json:"host,omitempty"`
-	Auth              Auth   `json:"auth"`
-	CapabilitySummary string `json:"capability_summary,omitempty"`
-	ConfiguredLimits  Limits `json:"configured_limits,omitempty"`
+	Name              string         `json:"name"`
+	Adapter           string         `json:"adapter"`
+	BaseURL           string         `json:"base_url,omitempty"`
+	PathPrefix        string         `json:"path_prefix,omitempty"`
+	Host              string         `json:"host,omitempty"`
+	Auth              Auth           `json:"auth"`
+	SSH               *SSHCapability `json:"ssh,omitempty"`
+	CapabilitySummary string         `json:"capability_summary,omitempty"`
+	ConfiguredLimits  Limits         `json:"configured_limits,omitempty"`
+}
+
+// SSHCapability describes only the session modes a bearer may request. It is
+// deliberately silent about the target, Unix user, host keys, and credential.
+type SSHCapability struct {
+	AllowShell         bool   `json:"allow_shell"`
+	AllowExec          bool   `json:"allow_exec"`
+	AllowPTY           bool   `json:"allow_pty"`
+	MaxSessionDuration string `json:"max_session_duration"`
 }
 
 type Auth struct {
@@ -85,12 +98,21 @@ func Build(compiled *config.Compiled, generatedAt, expiresAt time.Time, grants [
 		if !ok {
 			continue
 		}
-		manifest.Services = append(manifest.Services, Service{
+		service := Service{
 			Name: grant.Service, Adapter: projection.Adapter,
 			BaseURL: projection.BaseURL, PathPrefix: projection.PathPrefix, Host: projection.Host,
 			Auth:              Auth{Header: http.CanonicalHeaderKey(projection.ClientHeader), Prefix: projection.ClientPrefix},
 			CapabilitySummary: projection.CapabilitySummary, ConfiguredLimits: projectLimits(grant.Limits),
-		})
+		}
+		if projection.SSH != nil {
+			service.SSH = &SSHCapability{
+				AllowShell:         projection.SSH.AllowShell,
+				AllowExec:          projection.SSH.AllowExec,
+				AllowPTY:           projection.SSH.AllowPTY,
+				MaxSessionDuration: projection.SSH.MaxSessionDuration.Value().String(),
+			}
+		}
+		manifest.Services = append(manifest.Services, service)
 	}
 	sort.Slice(manifest.Services, func(i, j int) bool { return manifest.Services[i].Name < manifest.Services[j].Name })
 	if err := manifest.Validate(); err != nil {
@@ -121,6 +143,14 @@ func (manifest Manifest) Validate() error {
 		if service.BaseURL != "" && !validServiceURL(service) {
 			return ErrInvalidManifest
 		}
+		if service.Adapter == config.AdapterSSHSession {
+			if service.BaseURL == "" || !strings.EqualFold(service.Auth.Header, "Authorization") || service.Auth.Prefix != "Bearer " ||
+				!validSSHCapability(service.SSH) {
+				return ErrInvalidManifest
+			}
+		} else if service.SSH != nil {
+			return ErrInvalidManifest
+		}
 		if service.ConfiguredLimits.RequestsPerSecond == 0 && service.ConfiguredLimits.Burst != 0 {
 			return ErrInvalidManifest
 		}
@@ -129,20 +159,35 @@ func (manifest Manifest) Validate() error {
 	return nil
 }
 
+func validSSHCapability(capability *SSHCapability) bool {
+	if capability == nil || !capability.AllowShell && !capability.AllowExec {
+		return false
+	}
+	duration, err := time.ParseDuration(capability.MaxSessionDuration)
+	return err == nil && duration >= time.Second && duration <= 24*time.Hour && duration.String() == capability.MaxSessionDuration
+}
+
 func validAdapter(value string) bool {
-	return value == config.AdapterHTTP || value == config.AdapterGitSmartHTTP
+	return value == config.AdapterHTTP || value == config.AdapterGitSmartHTTP || value == config.AdapterSSHSession
 }
 
 func serviceContainsBearer(service Service) bool {
 	for _, value := range []string{
 		service.Name, service.Adapter, service.BaseURL, service.PathPrefix, service.Host,
-		service.Auth.Header, service.Auth.Prefix, service.CapabilitySummary,
+		service.Auth.Header, service.Auth.Prefix, service.CapabilitySummary, sshDuration(service.SSH),
 	} {
 		if tokens.ContainsBearer(value) {
 			return true
 		}
 	}
 	return false
+}
+
+func sshDuration(capability *SSHCapability) string {
+	if capability == nil {
+		return ""
+	}
+	return capability.MaxSessionDuration
 }
 
 func validServiceURL(service Service) bool {
@@ -398,6 +443,23 @@ func renderService(service Service, options RenderOptions) string {
 			fmt.Fprintf(&output, "  Native Git authentication: scope a credential helper to this exact service URL, clear inherited helpers, enable useHttpPath, and invoke `ff git-credential --url %q --token-file %q`.\n", service.BaseURL, tokenFile)
 		}
 	}
+	if service.Adapter == config.AdapterSSHSession {
+		output.WriteString("  Protocol: one terminating SSH session over this authenticated Forcefield route. SSH protocol port, agent, and X11 forwarding plus environment and subsystem requests are denied. Shell or exec retains the configured Unix account's filesystem and network authority.\n")
+		fmt.Fprintf(&output, "  Granted SSH modes: shell %s; exec %s; PTY %s; maximum session duration %s.\n",
+			yesNo(service.SSH.AllowShell), yesNo(service.SSH.AllowExec), yesNo(service.SSH.AllowPTY), service.SSH.MaxSessionDuration)
+		if origin := serviceOrigin(service.BaseURL); origin != "" && tokenFile != "" {
+			if service.SSH.AllowShell {
+				noPTY := ""
+				if !service.SSH.AllowPTY {
+					noPTY = " --no-pty"
+				}
+				fmt.Fprintf(&output, "  Native shell: `ff ssh --url %q --token-file %q%s %s`.\n", origin, tokenFile, noPTY, service.Name)
+			}
+			if service.SSH.AllowExec {
+				fmt.Fprintf(&output, "  Native command: `ff ssh --url %q --token-file %q %s -- COMMAND ...`.\n", origin, tokenFile, service.Name)
+			}
+		}
+	}
 	if service.CapabilitySummary != "" {
 		fmt.Fprintf(&output, "  Scope: %s\n", service.CapabilitySummary)
 	}
@@ -413,6 +475,25 @@ func renderService(service Service, options RenderOptions) string {
 		fmt.Fprintf(&output, "  TLS client identity: certificate %q; private key %q\n", clientCertPath, clientKeyPath)
 	}
 	return output.String()
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "yes"
+	}
+	return "no"
+}
+
+func serviceOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return ""
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func contextPath(value string) string {
