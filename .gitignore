@@ -2,5 +2,6 @@
 /dist/
 /*.log
 /forcefield
+/ff
 /.forcefield/
 /.forcefield-dev/
