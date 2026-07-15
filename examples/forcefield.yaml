@@ -1,0 +1,288 @@
+# Production-oriented template. It is safe by default for LLM writes because
+# model allowlists are non-working placeholders. Replace paths, PKI, upstream
+# credential scopes, approved models, and tested upstream API-version pins for
+# your environment.
+version: 1
+
+server:
+  listen: 0.0.0.0:7902
+  audience: forcefield-prod
+  admin_socket: /REPLACE/WITH/PRIVATE/FORCEFIELD/admin.sock
+  tls_cert: /REPLACE/WITH/PRIVATE/FORCEFIELD/pki/server.crt
+  tls_key: /REPLACE/WITH/PRIVATE/FORCEFIELD/pki/server.key
+  client_ca: /REPLACE/WITH/PRIVATE/FORCEFIELD/pki/workload-ca.crt
+  read_header_timeout: 5s
+  read_timeout: 30s
+  idle_timeout: 60s
+  max_token_ttl: 4h
+  max_request_bytes: 1048576
+
+state:
+  token_file: /REPLACE/WITH/PRIVATE/FORCEFIELD/tokens.json
+  audit_file: /REPLACE/WITH/PRIVATE/FORCEFIELD/audit.jsonl
+  audit_failure: closed
+
+secrets:
+  type: exec
+  command: /usr/local/bin/agent-secret
+  args: [get]
+  timeout: 5s
+  # Credential values are header-bound and capped at 16 KiB.
+  max_output_bytes: 16384
+  cache_ttl: 30s
+  max_cache_entries: 32
+
+services:
+  github:
+    upstream: https://api.github.com
+    path_prefix: /github
+    client_auth:
+      header: Authorization
+      prefix: "Bearer "
+    forward_headers:
+      - Accept
+      - Content-Type
+      - User-Agent
+    # Pin semantic/version headers in trusted configuration. Never let an
+    # untrusted SDK choose a different upstream API contract.
+    static_headers:
+      X-GitHub-Api-Version: "2022-11-28"
+    response:
+      strip_headers: [X-OAuth-Scopes, X-Accepted-OAuth-Scopes]
+      require_identity: true
+
+  openai:
+    # The SDK appends /responses to this upstream base path.
+    upstream: https://api.openai.com/v1
+    path_prefix: /openai
+    client_auth:
+      header: Authorization
+      prefix: "Bearer "
+    forward_headers: [Accept, Content-Type, User-Agent]
+    response:
+      require_identity: true
+
+  anthropic:
+    upstream: https://api.anthropic.com
+    path_prefix: /anthropic
+    # The Anthropic SDK presents its api_key in x-api-key.
+    client_auth:
+      header: X-Api-Key
+    forward_headers: [Accept, Content-Type, User-Agent]
+    static_headers:
+      Anthropic-Version: "2023-06-01"
+    response:
+      require_identity: true
+
+credentials:
+  github-reader:
+    service: github
+    secret_ref: GITHUB_READ_TOKEN
+    inject:
+      header: Authorization
+      prefix: "Bearer "
+
+  openai-project:
+    service: openai
+    secret_ref: OPENAI_API_KEY
+    inject:
+      header: Authorization
+      prefix: "Bearer "
+
+  anthropic-workspace:
+    service: anthropic
+    secret_ref: ANTHROPIC_API_KEY
+    inject:
+      header: X-Api-Key
+
+policies:
+  github-read:
+    service: github
+    body_limit: 262144
+    rules:
+      # This overlaps allow-actions-read. Deny wins regardless of source order.
+      - id: deny-actions-secret-metadata
+        effect: deny
+        methods: [GET]
+        paths: [/repos/*/*/actions/secrets/**]
+
+      - id: deny-graphql-mutations
+        effect: deny
+        methods: [POST]
+        paths: [/graphql]
+        graphql:
+          operation_type: mutation
+
+      - id: allow-repo-metadata
+        effect: allow
+        methods: [GET]
+        paths: [/repos/*/*]
+
+      - id: allow-repo-contents
+        effect: allow
+        methods: [GET]
+        paths: [/repos/*/*/contents/**]
+
+      - id: allow-actions-read
+        effect: allow
+        methods: [GET]
+        paths: [/repos/*/*/actions/**]
+
+      - id: allow-filtered-issues
+        effect: allow
+        methods: [GET]
+        paths: [/repos/*/*/issues]
+        query:
+          - key: state
+            op: in
+            values: [open, closed]
+          - key: per_page
+            op: in
+            values: ["10", "25", "50"]
+          # Link is intentionally stripped from responses. Callers paginate
+          # with an explicit, policy-bounded page parameter.
+          - key: page
+            op: in
+            values: ["1", "2", "3"]
+
+      - id: allow-one-issue
+        effect: allow
+        methods: [GET]
+        paths: [/repos/*/*/issues/*]
+
+      - id: allow-agent-graphql-read
+        effect: allow
+        methods: [POST]
+        paths: [/graphql]
+        graphql:
+          operation_type: query
+          operation_name: AgentRead
+          # Every expanded root field must be in this set.
+          root_fields: [viewer, repository, rateLimit]
+
+  openai-bounded:
+    service: openai
+    body_limit: 1048576
+    cel_cost_limit: 10000
+    cel_timeout: 10ms
+    rules:
+      - id: deny-stored-responses
+        effect: deny
+        methods: [POST]
+        paths: [/responses]
+        json:
+          - pointer: /store
+            op: eq
+            value: true
+
+      - id: deny-large-responses
+        effect: deny
+        methods: [POST]
+        paths: [/responses]
+        cel:
+          expression: 'body.max_output_tokens > 2048'
+
+      - id: allow-approved-responses
+        effect: allow
+        methods: [POST]
+        paths: [/responses]
+        json:
+          - pointer: /model
+            op: in
+            values: [REPLACE_WITH_APPROVED_OPENAI_MODEL]
+          - pointer: /store
+            op: eq
+            value: false
+        cel:
+          expression: 'body.max_output_tokens >= 1 && body.max_output_tokens <= 2048'
+
+  anthropic-bounded:
+    service: anthropic
+    body_limit: 1048576
+    cel_cost_limit: 10000
+    cel_timeout: 10ms
+    rules:
+      - id: deny-large-messages
+        effect: deny
+        methods: [POST]
+        paths: [/v1/messages]
+        cel:
+          expression: 'body.max_tokens > 2048'
+
+      - id: allow-approved-messages
+        effect: allow
+        methods: [POST]
+        paths: [/v1/messages]
+        json:
+          - pointer: /model
+            op: in
+            values: [REPLACE_WITH_APPROVED_ANTHROPIC_MODEL]
+        cel:
+          expression: 'body.max_tokens >= 1 && body.max_tokens <= 2048'
+
+roles:
+  github-reader:
+    grants:
+      - service: github
+        credential: github-reader
+        policy: github-read
+        limits:
+          requests_per_second: 5
+          burst: 10
+          request_budget: 10000
+          byte_budget: 104857600
+          max_request_bytes: 262144
+
+  openai-agent:
+    grants:
+      - service: openai
+        credential: openai-project
+        policy: openai-bounded
+        limits:
+          requests_per_second: 2
+          burst: 4
+          request_budget: 1000
+          byte_budget: 52428800
+          max_request_bytes: 1048576
+
+  anthropic-agent:
+    grants:
+      - service: anthropic
+        credential: anthropic-workspace
+        policy: anthropic-bounded
+        limits:
+          requests_per_second: 2
+          burst: 4
+          request_budget: 1000
+          byte_budget: 52428800
+          max_request_bytes: 1048576
+
+  combined-agent:
+    grants:
+      - service: github
+        credential: github-reader
+        policy: github-read
+        limits:
+          requests_per_second: 5
+          burst: 10
+          request_budget: 10000
+          byte_budget: 104857600
+          max_request_bytes: 262144
+      - service: openai
+        credential: openai-project
+        policy: openai-bounded
+        limits:
+          requests_per_second: 2
+          burst: 4
+          request_budget: 1000
+          byte_budget: 52428800
+          max_request_bytes: 1048576
+      - service: anthropic
+        credential: anthropic-workspace
+        policy: anthropic-bounded
+        limits:
+          requests_per_second: 2
+          burst: 4
+          request_budget: 1000
+          byte_budget: 52428800
+          max_request_bytes: 1048576

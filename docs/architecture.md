@@ -1,0 +1,230 @@
+# Architecture
+
+Forcefield is a reverse-proxy capability gateway. It deliberately does not
+accept an arbitrary destination. Every public route maps to one statically
+configured upstream and every usable token carries an immutable concrete grant
+for that service.
+
+## Components and trust boundaries
+
+```text
+untrusted workload                 Forcefield host
+------------------                 -----------------------------------
+HTTP client                        public data plane
+  ff_ bearer --------------------> route + canonicalize
+  request body                     resolve workload (mTLS SPKI or IP)
+                                   validate token + concrete grant
+                                   charge grant limits
+                                   evaluate deny-wins policy
+                                   append pre-authority audit record
+                                   fetch referenced host secret
+                                   rebuild headers from allowlist
+                                   inject real upstream credential
+                                                 |
+                                                 v
+                                      hardened direct transport
+                                      DNS/IP policy + TLS + optional pin
+                                                 |
+                                                 v
+trusted, pinned upstream <-----------------------+
+              response ----------> strip/redirect/exact-secret guard
+                                   stream response to workload
+
+trusted operator                    private control plane
+ff mint/delegate/revoke ----------> 0600 Unix socket + same-UID check
+                                   persistent token-digest store
+```
+
+The public data plane never exposes minting, delegation, or revocation. The
+control plane listens on an absolute Unix-socket path in a private directory.
+On Linux it checks the connecting process UID; on other systems it relies on
+the socket and directory permissions. Any process with the same trusted host
+UID can administer Forcefield, so agents should not run as that host user.
+
+## Request lifecycle
+
+For each request Forcefield performs these operations in order:
+
+1. Reject CONNECT, upgrades, trailers, absolute-form targets, ambiguous paths,
+   malformed queries, duplicate/invalid representation headers, and unknown
+   routes.
+2. Extract exactly one broker token from the service's configured inbound
+   header and prefix.
+3. Derive a workload identity from a verified client certificate, falling back
+   to the direct peer IP when no verified certificate exists.
+4. Validate the bearer digest, expiry, revocation chain, audience, and exact
+   workload binding, then cap the request context at token expiry. Authentication
+   failures are intentionally indistinguishable.
+5. Resolve exactly one concrete grant for the routed service. Its credential,
+   policy revision, and security-binding revision must still match the loaded
+   service.
+6. Atomically charge the matching grant at every token in the delegation chain,
+   buffer the request body under the finite global/grant/policy ceiling, recheck
+   late trailers, and evaluate policy over the service-relative canonical target.
+7. Append an allow record before any secret is fetched. With the default
+   `audit_failure: closed`, an audit error stops the request here. Revalidate
+   the immutable token/grant before and after the potentially slow secret lookup.
+8. Resolve the credential reference, create outbound headers only from the
+   configured allowlist, add operator-controlled static headers, inject the
+   credential with `Set` semantics, and send the request using the service's
+   direct hardened transport.
+9. Strip risky response headers, validate or rewrite redirects, scan response
+   headers for the exact secret, reject any non-final status outside 200--599,
+   and stream an exact-secret-filtered body.
+10. Append completion metadata correlated by request ID, public token ID, and
+    root token ID. Data-plane records include method, a SHA-256 path digest,
+    policy reason/rule IDs, and sizes, but the audit type cannot hold request
+    bodies, raw broker tokens, or credential values.
+
+Policy sees the exact canonical path and query subsequently forwarded. A path
+route is removed before evaluation: a request to `/github/repos/o/r` under
+`path_prefix: /github` is evaluated and forwarded as `/repos/o/r` (plus any
+configured path already present in the upstream URL).
+
+## Service, credential, policy, role, and token
+
+These are separate because each is a different security decision:
+
+```text
+service     = route + pinned upstream + transport + client token carrier
+credential  = service + host secret reference + upstream header injection
+policy      = service + immutable compiled matcher revision
+binding     = revision of security-relevant service/credential configuration
+grant       = service + credential + policy + binding revisions + ceilings
+role        = named template containing one or more grants
+token       = workload + audience + expiry + concrete immutable grants
+```
+
+A role is consulted only by `ff mint`. A minted token does not gain authority
+when a role later changes. A policy's SHA-256 revision includes its service,
+resource bounds, and rules. A separate binding revision covers the upstream,
+route, transport confinement, header/response controls, secret reference and
+injection, secret-backend mapping, global body ceiling, and request-read timeout.
+Changing either revision makes a token
+fail closed rather than silently changing its authority. Rotating the value
+behind an unchanged secret reference intentionally preserves the binding.
+
+Delegation creates another persisted bearer with a shorter-or-equal lifetime,
+a subset of services, the same concrete credential/policy/binding identities,
+and limits no broader than the parent. The current CLI can select a service
+subset but cannot tighten individual numeric limits. A request is atomically
+charged to the corresponding grant at every ancestor in its root-to-leaf chain:
+fan-out cannot evade an ancestor budget, and a narrower child cannot throttle a
+parent or sibling.
+
+## Upstream confinement
+
+The upstream URL is parsed at startup and cannot contain user info, a query, or
+a fragment. HTTPS is mandatory unless `allow_insecure_upstream` is explicitly
+set for an HTTP URL. Production configurations should never use that escape
+hatch.
+
+The outbound transport:
+
+- ignores proxy environment variables;
+- resolves the configured hostname, rejects the connection if any returned
+  address is neither public nor explicitly listed in `allowed_cidrs`, and dials
+  an accepted resolved address directly;
+- retains the configured hostname for SNI and ordinary system-root certificate
+  verification;
+- can additionally require a base64 SHA-256 SPKI pin;
+- disables automatic compression and requests `Accept-Encoding: identity`;
+- applies bounded connection, TLS, response-header, and header-size behavior.
+
+`allowed_cidrs` is an exception list for intentionally private upstreams, not a
+destination list supplied by the caller. SPKI pinning is additive: it does not
+turn off normal certificate verification.
+
+## Header adapter
+
+The v1 adapter separates the broker-token carrier from the real-credential
+carrier. For example, an agent can send `Authorization: Bearer ff_...` while
+Forcefield sends `x-api-key: real-value` upstream.
+
+Outbound headers are rebuilt from `forward_headers`, then trusted values from
+`static_headers` are added, and finally the configured credential is installed
+with `Set`. Known credential-, key-, token-, session-, and signature-bearing
+names, hop-by-hop/forwarding headers, `Content-Length`, `Accept-Encoding`, and
+auth carriers cannot be forwarded or static; static headers additionally
+exclude all representation/framing headers and `Host`. A header cannot be both
+forwarded and static. Static values are non-secret configuration—not a place
+for API keys—and only the separately injected credential is covered by the
+exact-value response scan. This lets an operator pin semantic contract headers such as
+`Anthropic-Version` and `X-GitHub-Api-Version` without trusting an SDK-selected
+value, while credential `Set` semantics prevent duplicate-header smuggling.
+
+This adapter is intentionally small. It handles only a static value injected in
+one header. It does not sign a request, perform an auth challenge, mint native
+temporary credentials, or rewrite a request body.
+
+## Response boundary
+
+By default Forcefield removes `Set-Cookie`, `Authentication-Info`,
+`Proxy-Authenticate`, `Alt-Svc`, `Refresh`, and `Link`, plus operator-configured
+headers. It rejects userinfo or cross-origin redirects. A same-origin redirect
+inside the configured upstream base is rewritten through the public Forcefield
+path so the client's next request is authorized again.
+
+Only final HTTP statuses from 200 through 599 may cross the upstream boundary.
+All 1xx responses, including protocol switching, and invalid statuses above 599
+are rejected rather than forwarded.
+
+Because `Link` remains stripped, clients must send explicit pagination query
+parameters covered by policy instead of depending on an upstream pagination
+link.
+
+The guard checks each remaining header and the streamed body for the exact
+secret byte string. It pre-reads up to 32 KiB through that filter before
+committing response headers, then streams the remainder. `require_identity`
+defaults to true and rejects an encoded upstream response, because compressed
+bytes cannot be searched for the plain secret. Forwarded responses are marked
+`Cache-Control: no-store`; upstream cache expiry metadata is removed. This is
+useful defense in depth, but cannot detect base64, URL-encoded, encrypted,
+split-and-transformed, or otherwise derived secret material. The
+[threat model](threat-model.md#response-reflection-and-a-malicious-upstream)
+describes the residual risk.
+
+## Adapter boundary and roadmap
+
+Forcefield should keep specialized authentication outside the generic header
+adapter:
+
+- **AWS SigV4:** requires a signer that hashes and signs the exact canonical
+  request, or a credential-vending endpoint that returns narrowly scoped,
+  short-lived native credentials. Static header replacement is incorrect.
+- **`gh` and Git:** `gh` has host and credential-selection behavior beyond a
+  simple arbitrary API base URL, while Git smart HTTP includes discovery,
+  redirects, and credential-helper conventions. Build explicit `gh`/Git
+  integration and test every redirect and auth challenge.
+- **OCI/Docker registries:** the bearer challenge and token-service exchange
+  create multiple pinned authorities and scope negotiation. This needs a
+  registry adapter, not a permissive second destination.
+- **Upstream mTLS:** requires host-side certificate/key selection and a service
+  transport adapter. The current TLS settings cover inbound workload mTLS only.
+- **SSH:** is not an HTTP tunnel use case. A future adapter should issue a
+  short-lived SSH certificate or expose a tightly constrained `ProxyCommand`
+  for a pinned host and operation; Forcefield must not become an arbitrary raw
+  TCP tunnel.
+- **High-impact operations:** when method/path/body filtering cannot express a
+  safe boundary, expose a narrow semantic operation that pins non-overridable
+  fields instead of transparently proxying the provider API.
+
+Adapters should preserve the same invariant: the configured service determines
+every possible upstream authority, authorization happens before credential
+access, and the representation authorized is the representation signed or sent.
+
+## Process and persistence model
+
+One `ff serve` process owns the data listener, admin socket, in-memory limit
+state, secret cache, append-only audit writer, and token store. Token mutations
+are persisted with a 0600 temporary file, fsync, atomic rename, and directory
+sync. Only SHA-256 bearer digests and claims are stored; newly minted bearer
+material is returned once.
+
+There is no runtime config reload. Restart to load configuration. On Linux and
+macOS the store owns a non-blocking exclusive lock file for its lifetime; a
+second process targeting the same token file fails closed, and platforms
+without the required lock are unsupported. Expired or revoked records and
+their inactive descendant subtrees are durably pruned on open and before token
+mutations. Rate and byte accounting is in memory and resets on restart; active
+token records and revocation state persist until they become pruneable.

@@ -1,0 +1,97 @@
+# Local, disposable demonstration only. This deliberately uses an environment
+# secret and cleartext loopback upstream so the quickstart needs no live API key.
+version: 1
+
+server:
+  listen: 127.0.0.1:7902
+  audience: forcefield-dev
+  admin_socket: /REPLACE/WITH/PRIVATE/FORCEFIELD_DEV/admin.sock
+  read_timeout: 30s
+  max_token_ttl: 1h
+  max_request_bytes: 65536
+
+state:
+  token_file: /REPLACE/WITH/PRIVATE/FORCEFIELD_DEV/tokens.json
+  audit_file: /REPLACE/WITH/PRIVATE/FORCEFIELD_DEV/audit.jsonl
+  audit_failure: closed
+
+secrets:
+  type: env
+  env_prefix: FF_SECRET_
+  cache_ttl: 0s
+
+services:
+  demo:
+    upstream: http://127.0.0.1:18080
+    allow_insecure_upstream: true
+    allowed_cidrs: [127.0.0.1/32]
+    path_prefix: /demo
+    client_auth:
+      header: Authorization
+      prefix: "Bearer "
+    forward_headers: [Accept, Content-Type]
+    response:
+      require_identity: true
+
+credentials:
+  demo-key:
+    service: demo
+    secret_ref: DEMO
+    inject:
+      header: Authorization
+      prefix: "Bearer "
+
+policies:
+  demo-bounded:
+    service: demo
+    body_limit: 65536
+    cel_cost_limit: 10000
+    cel_timeout: 10ms
+    rules:
+      # This overlaps allow-create below. Deny wins regardless of rule order.
+      - id: deny-admin-kind
+        effect: deny
+        methods: [POST]
+        paths: [/v1/resources]
+        json:
+          - pointer: /kind
+            op: eq
+            value: admin
+
+      - id: deny-delete
+        effect: deny
+        methods: [DELETE]
+        paths: [/**]
+
+      - id: allow-public-list
+        effect: allow
+        methods: [GET]
+        paths: [/v1/resources]
+        query:
+          - key: scope
+            op: eq
+            value: public
+
+      - id: allow-create
+        effect: allow
+        methods: [POST]
+        paths: [/v1/resources]
+        json:
+          - pointer: /kind
+            op: in
+            values: [note, task, admin]
+        cel:
+          expression: 'body.size >= 0 && body.size <= 4096'
+
+roles:
+  demo-agent:
+    grants:
+      - service: demo
+        credential: demo-key
+        policy: demo-bounded
+        limits:
+          requests_per_second: 5
+          burst: 10
+          request_budget: 1000
+          byte_budget: 1048576
+          max_request_bytes: 65536
