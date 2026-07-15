@@ -22,6 +22,7 @@ import (
 
 	"github.com/benhynes/forcefield/internal/audit"
 	"github.com/benhynes/forcefield/internal/config"
+	"github.com/benhynes/forcefield/internal/gitadapter"
 	"github.com/benhynes/forcefield/internal/policy"
 	"github.com/benhynes/forcefield/internal/secrets"
 	"github.com/benhynes/forcefield/internal/tokens"
@@ -66,13 +67,15 @@ type Gateway struct {
 }
 
 type runtimeService struct {
-	name       string
-	pathPrefix string
-	host       string
-	upstream   *url.URL
-	extractor  *HeaderAdapter
-	transport  http.RoundTripper
-	guard      ResponseGuard
+	name              string
+	adapter           string
+	gitRepositoryCase gitadapter.RepositoryCaseMode
+	pathPrefix        string
+	host              string
+	upstream          *url.URL
+	extractor         *HeaderAdapter
+	transport         http.RoundTripper
+	guard             ResponseGuard
 }
 
 type runtimeCredential struct {
@@ -148,12 +151,15 @@ func (g *Gateway) compileRuntime() error {
 			requireIdentity = *serviceConfig.Response.RequireIdentity
 		}
 		service := &runtimeService{
-			name: name, pathPrefix: serviceConfig.PathPrefix, host: strings.ToLower(serviceConfig.Host),
+			name: name, adapter: serviceConfig.Adapter, pathPrefix: serviceConfig.PathPrefix, host: strings.ToLower(serviceConfig.Host),
 			upstream: g.config.Upstreams[name], extractor: extractor, transport: transport,
 			guard: ResponseGuard{
 				Upstream: g.config.Upstreams[name], PublicPathPrefix: serviceConfig.PathPrefix,
 				StripHeaders: serviceConfig.Response.StripHeaders, RequireIdentity: requireIdentity,
 			},
+		}
+		if serviceConfig.Git != nil {
+			service.gitRepositoryCase = serviceConfig.Git.RepositoryCase
 		}
 		g.services[name] = service
 		if service.pathPrefix != "" {
@@ -170,7 +176,8 @@ func (g *Gateway) compileRuntime() error {
 		adapter, err := NewHeaderAdapter(HeaderAdapterConfig{
 			ClientHeader: serviceConfig.ClientAuth.Header, ClientPrefix: serviceConfig.ClientAuth.Prefix,
 			UpstreamHeader: credentialConfig.Inject.Header, UpstreamPrefix: credentialConfig.Inject.Prefix,
-			ForwardHeaders: serviceConfig.ForwardHeaders, StaticHeaders: serviceConfig.StaticHeaders,
+			UpstreamBasicUsername: credentialConfig.BasicUsername,
+			ForwardHeaders:        serviceConfig.ForwardHeaders, StaticHeaders: serviceConfig.StaticHeaders,
 		})
 		if err != nil {
 			return fmt.Errorf("credential %s adapter: %w", name, err)
@@ -213,6 +220,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.deny(w)
 		return
 	}
+	if service.adapter == config.AdapterGitSmartHTTP {
+		g.serveGit(w, r, canonical, service, relativePath, started, metadata)
+		return
+	}
 
 	token, err := service.extractor.ExtractToken(r)
 	if err != nil {
@@ -247,7 +258,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	credential := g.credentials[grant.CredentialRef]
 	compiledPolicy, policyOK := g.config.ResolveGrant(grant)
 	if credential == nil || credential.service != service.name || credential.bindingRevision == "" ||
-		grant.BindingRevision != credential.bindingRevision || !policyOK {
+		grant.BindingRevision != credential.bindingRevision || !policyOK || service.adapter != config.AdapterHTTP ||
+		compiledPolicy.Adapter != config.AdapterHTTP || compiledPolicy.Policy == nil {
 		g.recordDeny(started, metadata, service.name, workload, grantID, http.StatusNotFound, 0)
 		g.deny(w)
 		return
@@ -371,6 +383,11 @@ func (g *Gateway) forward(w http.ResponseWriter, in *http.Request, service *runt
 	if err := credential.adapter.RewriteHeaders(in.Header, out.Header, secret); err != nil {
 		return 0, 0, err
 	}
+	leakPatterns, err := credential.adapter.LeakPatterns(secret)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer zeroCredentialPatterns(leakPatterns)
 	out.Header.Set("Accept-Encoding", "identity")
 	response, err := service.transport.RoundTrip(out)
 	if err != nil {
@@ -380,7 +397,7 @@ func (g *Gateway) forward(w http.ResponseWriter, in *http.Request, service *runt
 	if response.StatusCode < 200 || response.StatusCode > 599 {
 		return 0, 0, errors.New("upstream returned an invalid final status")
 	}
-	if err := service.guard.Guard(response, secret); err != nil {
+	if err := service.guard.GuardPatterns(response, leakPatterns); err != nil {
 		return 0, 0, responseGuardError(err)
 	}
 	prefixBuffer := make([]byte, 32<<10)
@@ -627,7 +644,11 @@ func normalizeRequestRepresentation(header http.Header) bool {
 	if !ok {
 		return false
 	}
-	return encoding == "" || strings.EqualFold(strings.TrimSpace(encoding), "identity")
+	encoding = strings.ToLower(strings.TrimSpace(encoding))
+	// Generic HTTP policies still reject encoded bodies in prepareRequestBody.
+	// Git smart HTTP additionally accepts the two encodings emitted by Git's
+	// remote-curl client and decodes them before policy or upstream forwarding.
+	return encoding == "" || encoding == "identity" || encoding == "gzip" || encoding == "x-gzip"
 }
 
 func singletonHeader(header http.Header, name string) (string, bool) {

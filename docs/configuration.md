@@ -157,6 +157,7 @@ from same-user host processes.
 ```yaml
 services:
   github:
+    adapter: http
     upstream: https://api.github.com
     path_prefix: /github
     client_auth:
@@ -174,6 +175,8 @@ services:
 
 | Field | Required/default | Meaning |
 |---|---|---|
+| `adapter` | `http` | Request/policy adapter: `http` or `git-smart-http`. |
+| `git.repository_case` | required for Git | Repository URL identity mode: `sensitive` or `ascii-insensitive`. Invalid on the HTTP adapter. |
 | `upstream` | required | Fixed absolute HTTP(S) base. No userinfo, query, or fragment. HTTPS is required by default. |
 | `path_prefix` | exactly one route | Public path route such as `/github`; at most 4096 bytes and not `/`, trailing `/`, repeated slash, unsafe display controls, or embedded bearer material. Longest matching prefix wins. When an advertised origin is configured, the derived service URL must also fit the 4096-byte manifest field. |
 | `host` | exactly one route | Exact lowercase DNS hostname route instead of a path prefix. IP literals and trailing dots are invalid. |
@@ -211,6 +214,70 @@ and the response guard scans for the injected credential, not arbitrary static
 values. In particular, pin `Anthropic-Version` and `X-GitHub-Api-Version` here;
 do not forward an SDK-selected version header across the trust boundary.
 
+### Git smart-HTTP services
+
+A Git service is an explicit adapter over the same pinned transport and secret
+boundary:
+
+```yaml
+services:
+  git:
+    adapter: git-smart-http
+    git:
+      repository_case: ascii-insensitive
+    upstream: https://git.example.com
+    path_prefix: /git
+    client_auth:
+      header: Authorization
+      prefix: "Bearer "
+    forward_headers: [User-Agent]
+    response:
+      require_identity: true
+```
+
+For `git-smart-http`, `client_auth` must be exactly `Authorization` with prefix
+`Bearer ` and identity responses cannot be disabled. Git itself can still use
+HTTP Basic challenge/response: the bundled credential helper supplies the
+`ff_` bearer as its password, and Forcefield extracts it without forwarding
+that Basic value. The adapter, route, transport, response controls, and
+credential transformation are included in the binding revision.
+
+`git.repository_case` is required because repository URL spelling is a policy
+identity:
+
+- `sensitive` preserves the canonical URL repository path byte-for-byte. Use it
+  only for an upstream that treats case-distinct URL paths as distinct
+  repositories.
+- `ascii-insensitive` lowercases ASCII `A`--`Z` before repository-policy
+  matching and applies the same normalization to configured repository
+  patterns. It rejects non-ASCII repository paths and patterns rather than
+  guessing at Unicode normalization or case folding. Use it when the upstream
+  maps ASCII case variants to the same repository.
+
+This setting does not change ref-name matching, which remains case-sensitive.
+It is hashed into binding and policy revisions, so changing it requires new
+grants. Neither mode discovers general aliases: if an old path, rename alias,
+vanity URL, redirect, or Unicode-normalized name maps to the same physical
+repository, it must not be governed by different repository rules. Remove the
+alias or give all URL names for that repository identical Forcefield authority.
+The configured mode must exactly match every upstream repository-name mapping;
+otherwise a differently spelled URL can bypass a repository-specific deny.
+
+Only these service-relative smart-HTTP routes are accepted:
+
+- `GET /REPOSITORY.git/info/refs?service=git-upload-pack`
+- `POST /REPOSITORY.git/git-upload-pack` with Content-Type
+  `application/x-git-upload-pack-request`
+- `GET /REPOSITORY.git/info/refs?service=git-receive-pack`
+- `POST /REPOSITORY.git/git-receive-pack` with Content-Type
+  `application/x-git-receive-pack-request`
+
+`REPOSITORY.git` may contain multiple canonical path segments. The `.git`
+suffix, method, query, and RPC media type are mandatory and exact. The service
+prefix is removed first, so a public clone URL for the example is
+`https://forcefield.example/git/owner/repository.git`. Dumb Git HTTP endpoints,
+Git LFS endpoints, and hosting-provider REST APIs do not share this adapter.
+
 ## `credentials`
 
 ```yaml
@@ -235,6 +302,27 @@ example, both can be `x-api-key` with an empty prefix; for an API whose SDK
 expects a bearer token while the upstream expects a different header, configure
 those separately.
 
+For an upstream that treats a token as an HTTP Basic password, configure an
+otherwise empty-prefix `Authorization` injection plus `basic_username`:
+
+```yaml
+credentials:
+  git-user:
+    service: git
+    secret_ref: GIT_SMART_HTTP_TOKEN
+    inject:
+      header: Authorization
+    basic_username: broker
+```
+
+Forcefield sends `Authorization: Basic base64("broker:" + secret)`. The
+username is non-secret visible ASCII, at most 256 bytes, and cannot contain
+`:`; the secret remains in the host backend. `basic_username` requires the
+injection header to be `Authorization` and `inject.prefix` to be empty. Omit it
+when the upstream instead expects a bearer/token prefix. This upstream setting
+is independent of the guest-side `forcefield` username emitted by
+`ff git-credential`.
+
 At mint time the grant also captures a SHA-256 **binding revision** over the
 security-relevant service and route, upstream confinement, client-token
 carrier, forwarded and static headers, response controls, credential reference
@@ -245,6 +333,11 @@ different authority. Rotating the value behind an unchanged `secret_ref` does
 not change the binding revision.
 
 ## `policies`
+
+Policy syntax is selected by the service adapter. An `http` service uses the
+existing `rules`, body, GraphQL, and CEL fields. A `git-smart-http` service uses
+only the nested `git.rules` schema described below; mixing the two languages is
+rejected.
 
 ```yaml
 policies:
@@ -261,17 +354,18 @@ policies:
 |---|---|---|
 | `service` | required | The one service whose relative requests this policy can authorize. |
 | `capability_summary` | empty | Optional one-line, agent-facing description of the policy's useful scope; at most 512 UTF-8 bytes. It is advisory, not executable policy. |
-| `body_limit` | 1 MiB | Maximum body supplied to JSON, GraphQL, or CEL policy inspection. |
-| `cel_cost_limit` | 10000 | Per-expression CEL runtime cost ceiling. |
-| `cel_timeout` | `10ms` | Per-expression CEL evaluation deadline. |
-| `rules` | required (may be empty) | Compiled rules. Empty means deny every request. |
+| `body_limit` | 1 MiB | HTTP adapter only: maximum body supplied to JSON, GraphQL, or CEL policy inspection. |
+| `cel_cost_limit` | 10000 | HTTP adapter only: per-expression CEL runtime cost ceiling. |
+| `cel_timeout` | `10ms` | HTTP adapter only: per-expression CEL evaluation deadline. |
+| `rules` | HTTP adapter only; may be empty | Compiled HTTP rules. Empty means deny every request. |
+| `git.rules` | Git adapter only; 1--256 | Compiled repository/ref rules. |
 
-`body_limit` may not exceed `server.max_request_bytes`. Every request body is
-buffered under the smallest applicable server, policy-inspection, and concrete
-grant ceiling before policy evaluation. Streaming request uploads are therefore
-not supported in v1. Non-empty `Content-Encoding` other than `identity`, an
+For the HTTP adapter, `body_limit` may not exceed
+`server.max_request_bytes`. Every body is buffered under the smallest
+applicable server, policy-inspection, and concrete grant ceiling before policy
+evaluation. Non-empty `Content-Encoding` other than `identity`, an
 invalid/duplicate `Content-Type`, and trailers present before or after body
-reading fail closed.
+reading fail closed. Git RPC streaming has separate bounded behavior below.
 
 `capability_summary` is included in the policy revision, so changing it makes
 tokens carrying the previous revision fail closed unless that revision remains
@@ -287,7 +381,7 @@ Rule order has no meaning. Each rule is a conjunction: every configured matcher
 group in that rule must match. Within `methods` and `paths`, any listed member
 may match. Across query and JSON entries, all entries must match.
 
-Evaluation is:
+HTTP rule evaluation is:
 
 1. Any matcher error: deny.
 2. Otherwise, any matching `deny`: deny.
@@ -425,6 +519,112 @@ binary CEL `double`. A lossy value such as `0.1` therefore fails that CEL
 evaluation closed rather than being silently rounded. JSON pointer matchers
 continue to compare numbers by exact mathematical value.
 
+## Git smart-HTTP policies
+
+Git policy is provider- and branch-name-neutral. This example permits fetches
+from repositories under `engineering/`, permits branch creates/updates/deletes,
+and protects the arbitrary ref `refs/heads/stable`:
+
+```yaml
+policies:
+  git-engineering:
+    service: git
+    capability_summary: Fetch engineering repositories and push branches except the protected stable ref.
+    git:
+      rules:
+        - id: allow-fetch
+          effect: allow
+          operation: fetch
+          repositories: [engineering/**]
+
+        - id: allow-branch-push
+          effect: allow
+          operation: push
+          repositories: [engineering/**]
+          refs: [refs/heads/**]
+          update_kinds: [create, update, delete]
+
+        - id: deny-protected-stable
+          effect: deny
+          operation: push
+          repositories: [engineering/infrastructure.git]
+          refs: [refs/heads/stable]
+```
+
+There is no built-in `main`, infrastructure-repository, or hosting-provider
+rule. Another deployment can allow `refs/heads/main`, protect a tag namespace,
+or name its protected branch differently by changing only policy.
+
+Each Git rule has these fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | Unique lowercase identifier used in policy revisions and bounded audit metadata. |
+| `effect` | yes | `allow` or `deny`; rule order has no meaning. |
+| `operation` | yes | `fetch` or `push`. |
+| `repositories` | yes | One or more exact or recursive repository path patterns, including the `.git` suffix for exact paths. |
+| `refs` | push allow: yes; otherwise optional | Exact full refs or recursive ref-prefix patterns. |
+| `update_kinds` | push allow: yes; otherwise optional | Any of `create`, `update`, and `delete`. |
+
+Repository requests and repository patterns are first normalized using the
+service's required `git.repository_case`, then compared byte-for-byte. Ref
+matching is always case-sensitive and byte-for-byte after ref validation. A
+pattern is either exact or ends in `/**`, which matches every value below that
+slash-terminated prefix. A lone `**` is an explicit match-all and must be the
+only entry in its list. There are no substring globs: `release-*` and
+`owner/*/repo.git` are invalid. Exact repository values end in `.git`; ref
+values are full valid names beginning with `refs/`.
+
+Fetch is repository-wide. A fetch rule cannot contain `refs` or
+`update_kinds`, because upload-pack is not a sound branch-level confidentiality
+boundary. Once fetch is allowed, the client may request any object the upstream
+repository makes available. Use separate repositories or upstream object
+visibility controls when different refs require different read audiences.
+
+For a receive-pack push, Forcefield validates the pkt-line command prefix and
+derives the kind of every ref update: a zero old object ID is `create`, a zero
+new object ID is `delete`, and two nonzero IDs are `update`. Every update must
+match an allow rule, and any update matching a deny rejects the entire
+multi-ref request before credential lookup or an upstream call. A push deny
+with no `refs` or `update_kinds` denies that repository operation as a whole.
+Push discovery is allowed when some scoped push allow could apply; the concrete
+POST remains subject to per-update authorization. No match denies.
+
+Policy authorizes only the repository path and ref commands actually present on
+the smart-HTTP wire. Upstream `proc-receive` or other receive hooks must not
+rewrite an allowed command into an update, deployment, or privileged side
+effect on an unauthorized ref or repository. Forcefield cannot authorize an
+effect the upstream invents after request evaluation; hook code and
+configuration are part of the trusted upstream.
+
+Git's update command does not reveal whether an `update` is a fast-forward.
+Force and non-force updates have the same old-ID/new-ID/ref shape, and
+Forcefield does not load the repository object graph to prove ancestry. There
+is therefore no `force` update kind. Enforce non-fast-forward and merge rules
+with upstream branch protection or receive-pack configuration, while using
+Forcefield to restrict the observable repository/ref/update tuple.
+
+Git upload-pack requests and receive-pack pack data stream under the smaller of
+`server.max_request_bytes` and the concrete grant's `max_request_bytes` instead
+of being buffered wholesale. Receive-pack first buffers a bounded command
+prefix (up to 1 MiB and 1024 updates), authorizes all updates, then replays that
+prefix exactly while streaming the remaining pack. `byte_budget` is charged on
+decoded bytes as the upstream transport consumes them.
+
+RPC bodies may use identity, `gzip`, or `x-gzip`. Forcefield streams gzip
+decoding before policy and forwarding, removes the content encoding, bounds
+both compressed and decoded input by the request ceiling, applies a 100:1
+ratio guard with 1 MiB slack, and rejects concatenated/trailing gzip members.
+Request trailers and limit overruns abort the request. Size ceilings must be
+large enough for the intended pack files, and `server.read_timeout` must be
+long enough for the slowest permitted push.
+
+Fetch supports Git protocol v0, v1, and v2. Receive-pack supports v0/v1; a v2
+header on discovery is stripped to permit client fallback, and a protocol-v2
+push RPC is denied. Push certificates and push options are not supported and
+fail closed. Git LFS and dumb HTTP are separate protocols/endpoints and are not
+matched by this adapter.
+
 ## `roles` and grant limits
 
 ```yaml
@@ -452,7 +652,8 @@ For rate and aggregate budgets, `0` means unlimited:
 - `requests_per_second`: token-bucket refill rate.
 - `burst`: bucket capacity; defaults to 1 when a rate is set and burst is zero.
 - `request_budget`: aggregate request attempts for the root token/grant.
-- `byte_budget`: aggregate client-to-upstream request body bytes only.
+- `byte_budget`: aggregate client-to-upstream request body bytes only. For a
+  gzip-encoded Git RPC, this counts decoded bytes forwarded upstream.
 - `max_request_bytes`: per-request body ceiling; `0` in a role inherits the
   finite `server.max_request_bytes` rather than becoming unlimited.
 
@@ -466,8 +667,9 @@ charged against `byte_budget` in v1.
 ## Production example
 
 [examples/forcefield.yaml](../examples/forcefield.yaml) combines TLS/mTLS,
-`agent-secret`, REST/query rules, JSON and CEL bounds, GraphQL allowlisting,
-deny-wins overlap, separate credentials, and roles. Replace all marked paths,
-the advertised origin, certificate files, identity assumptions, approved model
-placeholders, and review the pinned upstream API versions before use. Then run
-`ff check` and adversarial tests.
+`agent-secret`, REST/query rules, JSON and CEL bounds, GraphQL allowlisting, a
+generic Git smart-HTTP policy, deny-wins overlap, separate credentials, and
+roles. Replace all marked paths, origins, certificate files, identity
+assumptions, repository namespaces, approved model placeholders, and review
+the pinned upstream API versions before use. Then run `ff check` and
+adversarial tests.

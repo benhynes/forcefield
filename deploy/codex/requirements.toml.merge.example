@@ -1,0 +1,25 @@
+allow_managed_hooks_only = true
+
+[features]
+hooks = true
+
+[hooks]
+managed_dir = "/etc/codex/hooks"
+
+[[hooks.SessionStart]]
+matcher = "^(startup|resume|clear|compact)$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/etc/codex/hooks/forcefield-capabilities"
+timeout = 10
+statusMessage = "Loading Forcefield capabilities"
+
+[[hooks.SubagentStart]]
+matcher = ""
+
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "/etc/codex/hooks/forcefield-capabilities"
+timeout = 10
+statusMessage = "Loading Forcefield capabilities"

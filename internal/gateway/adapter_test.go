@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"encoding/base64"
 	"net/http"
+	"slices"
 	"testing"
 )
 
@@ -35,6 +37,34 @@ func TestHeaderAdapterExtractAndRewrite(t *testing.T) {
 	}
 	if got := out.Get("Anthropic-Version"); got != "2023-06-01" {
 		t.Fatalf("static version header = %q", got)
+	}
+}
+
+func TestHeaderAdapterBasicPasswordInjectionAndLeakPatterns(t *testing.T) {
+	t.Parallel()
+	adapter, err := NewHeaderAdapter(HeaderAdapterConfig{
+		ClientHeader: "Authorization", ClientPrefix: "Bearer ", UpstreamHeader: "Authorization",
+		UpstreamBasicUsername: "broker-user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("upstream-token")
+	out := make(http.Header)
+	if err := adapter.RewriteHeaders(make(http.Header), out, secret); err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("broker-user:upstream-token"))
+	if got := out.Get("Authorization"); got != "Basic "+encoded {
+		t.Fatalf("Authorization = %q", got)
+	}
+	patterns, err := adapter.LeakPatterns(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zeroCredentialPatterns(patterns)
+	if len(patterns) != 2 || !slices.Equal(patterns[0], secret) || string(patterns[1]) != encoded {
+		t.Fatalf("leak patterns = %q", patterns)
 	}
 }
 

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+exec /usr/local/bin/ff capabilities \
+  --url "https://forcefield.internal:7902" \
+  --token-file "/run/forcefield/token" \
+  --ca-cert "/run/forcefield/ca.crt" \
+  --client-cert "/run/forcefield/client.crt" \
+  --client-key "/run/forcefield/client.key" \
+  --format codex-hook

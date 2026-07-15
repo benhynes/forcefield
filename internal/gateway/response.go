@@ -29,20 +29,34 @@ type ResponseGuard struct {
 }
 
 func (g ResponseGuard) Guard(resp *http.Response, secret []byte) error {
-	if resp == nil || g.Upstream == nil || len(secret) == 0 {
+	return g.GuardPatterns(resp, [][]byte{secret})
+}
+
+// GuardPatterns applies the response boundary to every exact credential
+// representation produced by an injector (for example, both a raw password
+// and its HTTP Basic base64 payload).
+func (g ResponseGuard) GuardPatterns(resp *http.Response, patterns [][]byte) error {
+	if resp == nil || g.Upstream == nil || len(patterns) == 0 {
 		return errors.New("invalid response guard state")
+	}
+	for _, pattern := range patterns {
+		if len(pattern) == 0 {
+			return errors.New("invalid response guard state")
+		}
 	}
 	strip := append([]string{"Set-Cookie", "Authentication-Info", "Proxy-Authenticate", "Alt-Svc", "Refresh", "Link"}, g.StripHeaders...)
 	for _, name := range strip {
 		resp.Header.Del(name)
 	}
 	for name, values := range resp.Header {
-		if bytes.Contains(bytes.ToLower([]byte(name)), bytes.ToLower(secret)) {
-			return ErrSecretReflection
-		}
-		for _, value := range values {
-			if bytes.Contains([]byte(value), secret) {
+		for _, pattern := range patterns {
+			if bytes.Contains(bytes.ToLower([]byte(name)), bytes.ToLower(pattern)) {
 				return ErrSecretReflection
+			}
+			for _, value := range values {
+				if bytes.Contains([]byte(value), pattern) {
+					return ErrSecretReflection
+				}
 			}
 		}
 	}
@@ -60,7 +74,9 @@ func (g ResponseGuard) Guard(resp *http.Response, secret []byte) error {
 		}
 	}
 	if resp.Body != nil {
-		resp.Body = newSecretFilteringBody(resp.Body, secret)
+		for _, pattern := range patterns {
+			resp.Body = newSecretFilteringBody(resp.Body, pattern)
+		}
 	}
 	return nil
 }

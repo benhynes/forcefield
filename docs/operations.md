@@ -180,12 +180,13 @@ quota, and a listed grant may already be exhausted. Failures remain opaque, so
 a generic 404 can mean invalid, revoked,
 misbound, outside the grant, or nonexistent.
 
-For Claude Code, install managed `SessionStart` and `SubagentStart` hooks that
-run the same command with `--format claude-hook`, plus the local `ff mcp` server
-for on-demand refresh. Large MCP results are cursor-paginated; follow the
-returned cursor until complete. See [Automatic agent capability
-awareness](agent-awareness.md) and the safe examples under
-[`deploy/claude`](../deploy/claude/). The injected text is advisory and can
+For Claude Code or Codex CLI, install administrator-managed `SessionStart` and
+`SubagentStart` hooks using `--format claude-hook` or `--format codex-hook`,
+respectively, plus the local `ff mcp` server for on-demand refresh. Large MCP
+results are cursor-paginated; follow the returned cursor until complete. See
+[Automatic agent capability awareness](agent-awareness.md) and the safe
+examples under [`deploy/claude`](../deploy/claude/) and
+[`deploy/codex`](../deploy/codex/). The injected text is advisory and can
 become stale immediately after revocation or rollout; Forcefield remains
 authoritative on every real request.
 

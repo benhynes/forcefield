@@ -42,6 +42,14 @@ func TestCapabilityMCPServerExposesOneSanitizedLiveTool(t *testing.T) {
 	client, session := connectMCPTest(t, server)
 	defer client.Close()
 	defer session.Close()
+	initialize := session.InitializeResult()
+	if initialize == nil || initialize.Instructions != capabilityMCPInstructions || len(initialize.Instructions) > 512 ||
+		!strings.Contains(initialize.Instructions, "Consult the capabilities tool") ||
+		!strings.Contains(initialize.Instructions, "Remaining quota is not reported") ||
+		!strings.Contains(initialize.Instructions, "Forcefield remains authoritative") ||
+		strings.Contains(initialize.Instructions, "ff_") || strings.Contains(initialize.Instructions, "/run/forcefield") {
+		t.Fatalf("MCP instructions = %#v", initialize)
+	}
 
 	listed, err := session.ListTools(context.Background(), nil)
 	if err != nil {

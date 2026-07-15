@@ -86,7 +86,7 @@ func Build(compiled *config.Compiled, generatedAt, expiresAt time.Time, grants [
 			continue
 		}
 		manifest.Services = append(manifest.Services, Service{
-			Name: grant.Service, Adapter: "http",
+			Name: grant.Service, Adapter: projection.Adapter,
 			BaseURL: projection.BaseURL, PathPrefix: projection.PathPrefix, Host: projection.Host,
 			Auth:              Auth{Header: http.CanonicalHeaderKey(projection.ClientHeader), Prefix: projection.ClientPrefix},
 			CapabilitySummary: projection.CapabilitySummary, ConfiguredLimits: projectLimits(grant.Limits),
@@ -106,7 +106,7 @@ func (manifest Manifest) Validate() error {
 	}
 	previous := ""
 	for _, service := range manifest.Services {
-		if !validID(service.Name) || service.Name <= previous || service.Adapter != "http" ||
+		if !validID(service.Name) || service.Name <= previous || !validAdapter(service.Adapter) ||
 			(service.PathPrefix == "") == (service.Host == "") || !validHeader(service.Auth.Header) ||
 			!validAuthPrefix(service.Auth.Prefix) ||
 			!validSummary(service.CapabilitySummary) || serviceContainsBearer(service) {
@@ -127,6 +127,10 @@ func (manifest Manifest) Validate() error {
 		previous = service.Name
 	}
 	return nil
+}
+
+func validAdapter(value string) bool {
+	return value == config.AdapterHTTP || value == config.AdapterGitSmartHTTP
 }
 
 func serviceContainsBearer(service Service) bool {
@@ -383,10 +387,17 @@ func renderService(service Service, options RenderOptions) string {
 	}
 	output.WriteByte('\n')
 	fmt.Fprintf(&output, "  Authentication carrier: %s: %s<Forcefield token>", service.Auth.Header, service.Auth.Prefix)
-	if tokenFile := contextPath(options.TokenFile); tokenFile != "" {
+	tokenFile := contextPath(options.TokenFile)
+	if tokenFile != "" {
 		fmt.Fprintf(&output, " from %q", tokenFile)
 	}
 	output.WriteByte('\n')
+	if service.Adapter == config.AdapterGitSmartHTTP {
+		output.WriteString("  Protocol: Git smart HTTP only; repository URLs must end in .git. Git LFS, dumb HTTP, archives, SSH, and provider web/API routes are not part of this service.\n")
+		if service.BaseURL != "" && tokenFile != "" {
+			fmt.Fprintf(&output, "  Native Git authentication: scope a credential helper to this exact service URL, clear inherited helpers, enable useHttpPath, and invoke `ff git-credential --url %q --token-file %q`.\n", service.BaseURL, tokenFile)
+		}
+	}
 	if service.CapabilitySummary != "" {
 		fmt.Fprintf(&output, "  Scope: %s\n", service.CapabilitySummary)
 	}

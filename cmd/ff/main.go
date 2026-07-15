@@ -61,6 +61,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runCapabilities(args[1:], stdin, stdout, stderr)
 	case "mcp":
 		return runMCP(args[1:], stdin, stdout)
+	case "git-credential":
+		return runGitCredential(args[1:], stdin, stdout)
 	case "version", "--version", "-version":
 		_, err := fmt.Fprintln(stdout, version)
 		return err
@@ -451,8 +453,9 @@ Usage:
   ff delegate --config forcefield.yaml --caller-workload ID --workload CHILD_ID < parent-token
   ff revoke   --config forcefield.yaml --token-id TOKEN_ID
   ff identity --ip VM_IP | --cert CLIENT_CERT
-  ff capabilities --url FORCEFIELD_ORIGIN [--format text|json|claude-hook]
+  ff capabilities --url FORCEFIELD_ORIGIN [--format text|json|claude-hook|codex-hook]
   ff mcp --url FORCEFIELD_ORIGIN [--token-file PATH]
+  ff git-credential --url FORCEFIELD_GIT_URL --token-file PATH get|store|erase
   ff version
 `)
 }

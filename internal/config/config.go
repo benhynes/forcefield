@@ -25,6 +25,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/benhynes/forcefield/internal/gitadapter"
 	"github.com/benhynes/forcefield/internal/headersafety"
 	"github.com/benhynes/forcefield/internal/policy"
 	"github.com/benhynes/forcefield/internal/tokens"
@@ -33,6 +34,12 @@ import (
 
 const (
 	maxConfigBytes = 4 << 20
+
+	// AdapterHTTP is the default request/policy adapter used by existing API
+	// services. AdapterGitSmartHTTP exposes only Git's smart-HTTP fetch and push
+	// protocol surface; repository and ref authority is supplied by policy.
+	AdapterHTTP         = "http"
+	AdapterGitSmartHTTP = "git-smart-http"
 
 	// CapabilitiesPath is reserved by the data plane for live, authenticated
 	// discovery of the calling token's sanitized grants. Configured path routes
@@ -111,6 +118,8 @@ type SecretBackendConfig struct {
 }
 
 type ServiceConfig struct {
+	Adapter               string            `json:"adapter,omitempty" yaml:"adapter,omitempty"`
+	Git                   *GitServiceConfig `json:"git,omitempty" yaml:"git,omitempty"`
 	Upstream              string            `json:"upstream" yaml:"upstream"`
 	PathPrefix            string            `json:"path_prefix,omitempty" yaml:"path_prefix,omitempty"`
 	Host                  string            `json:"host,omitempty" yaml:"host,omitempty"`
@@ -121,6 +130,10 @@ type ServiceConfig struct {
 	ForwardHeaders        []string          `json:"forward_headers,omitempty" yaml:"forward_headers,omitempty"`
 	StaticHeaders         map[string]string `json:"static_headers,omitempty" yaml:"static_headers,omitempty"`
 	Response              ResponseConfig    `json:"response,omitempty" yaml:"response,omitempty"`
+}
+
+type GitServiceConfig struct {
+	RepositoryCase gitadapter.RepositoryCaseMode `json:"repository_case" yaml:"repository_case"`
 }
 
 type HeaderAuth struct {
@@ -134,9 +147,10 @@ type ResponseConfig struct {
 }
 
 type CredentialConfig struct {
-	Service   string     `json:"service" yaml:"service"`
-	SecretRef string     `json:"secret_ref" yaml:"secret_ref"`
-	Inject    HeaderAuth `json:"inject" yaml:"inject"`
+	Service       string     `json:"service" yaml:"service"`
+	SecretRef     string     `json:"secret_ref" yaml:"secret_ref"`
+	Inject        HeaderAuth `json:"inject" yaml:"inject"`
+	BasicUsername string     `json:"basic_username,omitempty" yaml:"basic_username,omitempty"`
 }
 
 type PolicyConfig struct {
@@ -145,7 +159,24 @@ type PolicyConfig struct {
 	BodyLimit         int64             `json:"body_limit,omitempty" yaml:"body_limit,omitempty"`
 	CELCostLimit      uint64            `json:"cel_cost_limit,omitempty" yaml:"cel_cost_limit,omitempty"`
 	CELTimeout        Duration          `json:"cel_timeout,omitempty" yaml:"cel_timeout,omitempty"`
-	Rules             []policy.RuleSpec `json:"rules" yaml:"rules"`
+	Rules             []policy.RuleSpec `json:"rules,omitempty" yaml:"rules,omitempty"`
+	Git               *GitPolicyConfig  `json:"git,omitempty" yaml:"git,omitempty"`
+}
+
+// GitPolicyConfig is intentionally separate from the generic HTTP policy
+// language. Smart-HTTP push authorization is semantic: every receive-pack ref
+// update must be parsed and authorized before an upstream credential is used.
+type GitPolicyConfig struct {
+	Rules []GitRuleConfig `json:"rules" yaml:"rules"`
+}
+
+type GitRuleConfig struct {
+	ID           string                  `json:"id" yaml:"id"`
+	Effect       gitadapter.Effect       `json:"effect" yaml:"effect"`
+	Operation    gitadapter.Operation    `json:"operation" yaml:"operation"`
+	Repositories []string                `json:"repositories" yaml:"repositories"`
+	Refs         []string                `json:"refs,omitempty" yaml:"refs,omitempty"`
+	UpdateKinds  []gitadapter.UpdateKind `json:"update_kinds,omitempty" yaml:"update_kinds,omitempty"`
 }
 
 type RoleConfig struct {
@@ -177,18 +208,20 @@ func (l LimitsConfig) TokenLimits() tokens.Limits {
 type CompiledPolicy struct {
 	Name              string
 	Service           string
+	Adapter           string
 	Revision          string
 	CapabilitySummary string
 	Policy            *policy.Policy
+	GitPolicy         *gitadapter.Policy
 }
 
 // CapabilityProjection is the immutable, agent-visible portion of one
 // revision-resolved grant. It contains routing guidance, never authority or
 // credential material.
 type CapabilityProjection struct {
-	Service, BaseURL, PathPrefix, Host string
-	ClientHeader, ClientPrefix         string
-	CapabilitySummary                  string
+	Service, Adapter, BaseURL, PathPrefix, Host string
+	ClientHeader, ClientPrefix                  string
+	CapabilitySummary                           string
 }
 
 type Compiled struct {
@@ -329,6 +362,12 @@ func applyDefaults(file *File) {
 	if file.Secrets.MaxCacheEntries == 0 {
 		file.Secrets.MaxCacheEntries = 128
 	}
+	for name, service := range file.Services {
+		if service.Adapter == "" {
+			service.Adapter = AdapterHTTP
+			file.Services[name] = service
+		}
+	}
 }
 
 func validateServer(server ServerConfig) error {
@@ -424,6 +463,20 @@ func compileServices(compiled *Compiled) error {
 		if !validID(name) {
 			return invalid("invalid service name " + name)
 		}
+		if service.Adapter != AdapterHTTP && service.Adapter != AdapterGitSmartHTTP {
+			return invalid("service " + name + " has an unsupported adapter")
+		}
+		if service.Adapter == AdapterHTTP && service.Git != nil {
+			return invalid("service " + name + " cannot use git settings with the HTTP adapter")
+		}
+		if service.Adapter == AdapterGitSmartHTTP {
+			if service.Git == nil {
+				return invalid("service " + name + " git-smart-http requires git.repository_case")
+			}
+			if _, err := gitadapter.NormalizeRepository("repository.git", service.Git.RepositoryCase); err != nil {
+				return invalid("service " + name + " has an invalid git.repository_case")
+			}
+		}
 		upstream, err := url.Parse(service.Upstream)
 		if err != nil || upstream.Host == "" || upstream.User != nil || upstream.RawQuery != "" || upstream.ForceQuery || upstream.Fragment != "" {
 			return invalid("service " + name + " has invalid upstream")
@@ -475,9 +528,20 @@ func compileServices(compiled *Compiled) error {
 		if !validAuthHeader(service.ClientAuth) {
 			return invalid("service " + name + " client_auth.header is required")
 		}
+		if service.Adapter == AdapterGitSmartHTTP {
+			if !strings.EqualFold(service.ClientAuth.Header, "Authorization") || service.ClientAuth.Prefix != "Bearer " {
+				return invalid("service " + name + " git-smart-http client_auth must be Authorization Bearer")
+			}
+			if service.Response.RequireIdentity != nil && !*service.Response.RequireIdentity {
+				return invalid("service " + name + " git-smart-http requires identity responses")
+			}
+		}
 		forwardedNames := make(map[string]struct{}, len(service.ForwardHeaders))
 		for _, header := range service.ForwardHeaders {
 			canonicalName := strings.ToLower(header)
+			if service.Adapter == AdapterGitSmartHTTP && gitDerivedHeader(canonicalName) {
+				return invalid("service " + name + " cannot forward Git protocol-derived header " + header)
+			}
 			if _, duplicate := forwardedNames[canonicalName]; duplicate {
 				return invalid("service " + name + " has duplicate canonical forwarded headers")
 			}
@@ -538,7 +602,7 @@ func compileServices(compiled *Compiled) error {
 			return invalid("service " + name + " advertised URL exceeds the capability manifest limit")
 		}
 		compiled.capabilityServices[name] = CapabilityProjection{
-			Service: name, BaseURL: advertisedURL,
+			Service: name, Adapter: service.Adapter, BaseURL: advertisedURL,
 			PathPrefix: service.PathPrefix, Host: strings.ToLower(service.Host),
 			ClientHeader: service.ClientAuth.Header, ClientPrefix: service.ClientAuth.Prefix,
 		}
@@ -576,6 +640,9 @@ func compileCredentials(compiled *Compiled) error {
 	for name, credential := range compiled.File.Credentials {
 		if !validID(name) || !validSecretReference(credential.SecretRef, compiled.File.Secrets.Type == "env") || !validAuthHeader(credential.Inject) {
 			return invalid("invalid credential " + name)
+		}
+		if credential.BasicUsername != "" && (!strings.EqualFold(credential.Inject.Header, "Authorization") || credential.Inject.Prefix != "" || !validBasicUsername(credential.BasicUsername)) {
+			return invalid("credential " + name + " has an invalid basic_username injection")
 		}
 		if _, exists := compiled.File.Services[credential.Service]; !exists {
 			return invalid("credential " + name + " references unknown service")
@@ -621,29 +688,47 @@ func compilePolicies(compiled *Compiled) error {
 		if !validCapabilitySummary(spec.CapabilitySummary) {
 			return invalid("policy " + name + " has an invalid capability_summary")
 		}
-		compiledPolicy, err := policy.Compile(policy.Spec{Rules: spec.Rules}, policy.Options{
-			BodyLimit: spec.BodyLimit, CELCostLimit: spec.CELCostLimit, CELTimeout: spec.CELTimeout.Value(),
-		})
+		adapter := compiled.File.Services[spec.Service].Adapter
+		entry := CompiledPolicy{
+			Name: name, Service: spec.Service, Adapter: adapter,
+			CapabilitySummary: spec.CapabilitySummary,
+		}
+		var err error
+		switch adapter {
+		case AdapterHTTP:
+			if spec.Git != nil {
+				return invalid("policy " + name + " cannot use git rules with the HTTP adapter")
+			}
+			entry.Policy, err = policy.Compile(policy.Spec{Rules: spec.Rules}, policy.Options{
+				BodyLimit: spec.BodyLimit, CELCostLimit: spec.CELCostLimit, CELTimeout: spec.CELTimeout.Value(),
+			})
+			if err != nil {
+				return invalid("compile policy " + name + ": " + err.Error())
+			}
+			if entry.Policy.MaxBodyBytes() > int64(compiled.File.Server.MaxRequestBytes) {
+				return invalid("policy " + name + " body limit exceeds server max_request_bytes")
+			}
+			entry.Revision, err = policyRevision(spec, entry.Policy)
+		case AdapterGitSmartHTTP:
+			if spec.Git == nil || len(spec.Rules) != 0 || spec.BodyLimit != 0 || spec.CELCostLimit != 0 || spec.CELTimeout != 0 {
+				return invalid("policy " + name + " must use only git rules with the git-smart-http adapter")
+			}
+			entry.GitPolicy, err = compileGitPolicy(*spec.Git, compiled.File.Services[spec.Service].Git.RepositoryCase)
+			if err == nil {
+				entry.Revision, err = gitPolicyRevision(spec, compiled.File.Services[spec.Service].Git.RepositoryCase)
+			}
+		default:
+			err = errors.New("unsupported adapter")
+		}
 		if err != nil {
 			return invalid("compile policy " + name + ": " + err.Error())
 		}
-		if compiledPolicy.MaxBodyBytes() > int64(compiled.File.Server.MaxRequestBytes) {
-			return invalid("policy " + name + " body limit exceeds server max_request_bytes")
-		}
-		revision, err := policyRevision(spec, compiledPolicy)
-		if err != nil {
-			return invalid("hash policy " + name)
-		}
-		entry := CompiledPolicy{
-			Name: name, Service: spec.Service, Revision: revision,
-			CapabilitySummary: spec.CapabilitySummary, Policy: compiledPolicy,
-		}
-		if previous, exists := compiled.PoliciesByRevision[revision]; exists && previous.Name != name {
+		if previous, exists := compiled.PoliciesByRevision[entry.Revision]; exists && previous.Name != name {
 			return invalid("policies have an identical revision")
 		}
 		compiled.Policies[name] = entry
-		compiled.PoliciesByRevision[revision] = entry
-		compiled.policyRevisions[revision] = entry
+		compiled.PoliciesByRevision[entry.Revision] = entry
+		compiled.policyRevisions[entry.Revision] = entry
 	}
 	return nil
 }
@@ -743,7 +828,7 @@ func validateCapabilityManifestBound(compiled *Compiled) error {
 			return invalid("policy " + policyEntry.Name + " has no capability projection")
 		}
 		candidate := manifestService{
-			Name: policyEntry.Service, Adapter: "http", BaseURL: projection.BaseURL,
+			Name: policyEntry.Service, Adapter: projection.Adapter, BaseURL: projection.BaseURL,
 			PathPrefix: projection.PathPrefix, Host: projection.Host,
 			Auth:              manifestAuth{Header: http.CanonicalHeaderKey(projection.ClientHeader), Prefix: projection.ClientPrefix},
 			CapabilitySummary: policyEntry.CapabilitySummary, ConfiguredLimits: longestLimits,
@@ -778,6 +863,10 @@ func validateCapabilityManifestBound(compiled *Compiled) error {
 
 func bindingRevision(compiled *Compiled, credentialName string, credential CredentialConfig) (string, error) {
 	service := compiled.File.Services[credential.Service]
+	var gitRepositoryCase gitadapter.RepositoryCaseMode
+	if service.Git != nil {
+		gitRepositoryCase = service.Git.RepositoryCase
+	}
 	prefixes := make([]string, 0, len(compiled.AllowedPrefixes[credential.Service]))
 	for _, prefix := range compiled.AllowedPrefixes[credential.Service] {
 		prefixes = append(prefixes, prefix.String())
@@ -826,6 +915,36 @@ func bindingRevision(compiled *Compiled, credentialName string, credential Crede
 		return "", err
 	}
 	digest := sha256.Sum256(encoded)
+	if credential.BasicUsername != "" {
+		basicMaterial := struct {
+			Engine   string
+			Username string
+			Base     [sha256.Size]byte
+		}{
+			Engine: "forcefield-binding-basic-password/v1", Username: credential.BasicUsername, Base: digest,
+		}
+		encoded, err = json.Marshal(basicMaterial)
+		if err != nil {
+			return "", err
+		}
+		digest = sha256.Sum256(encoded)
+	}
+	if service.Adapter == AdapterGitSmartHTTP {
+		gitMaterial := struct {
+			Engine         string
+			Adapter        string
+			RepositoryCase gitadapter.RepositoryCaseMode
+			Base           [sha256.Size]byte
+		}{
+			Engine: "forcefield-binding-git-smart-http/v1", Adapter: service.Adapter,
+			RepositoryCase: gitRepositoryCase, Base: digest,
+		}
+		encoded, err = json.Marshal(gitMaterial)
+		if err != nil {
+			return "", err
+		}
+		digest = sha256.Sum256(encoded)
+	}
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
@@ -857,6 +976,190 @@ func policyRevision(spec PolicyConfig, compiled *policy.Policy) (string, error) 
 	}{
 		Engine: policy.EngineRevision, Service: spec.Service, CapabilitySummary: spec.CapabilitySummary,
 		Options: compiled.EffectiveOptions(), Rules: canonicalPolicyRules(spec.Rules),
+	}
+	encoded, err := json.Marshal(material)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func compileGitPolicy(spec GitPolicyConfig, repositoryCase gitadapter.RepositoryCaseMode) (*gitadapter.Policy, error) {
+	if len(spec.Rules) == 0 || len(spec.Rules) > 256 {
+		return nil, errors.New("git policy must contain between 1 and 256 rules")
+	}
+	compiled := make([]gitadapter.Rule, 0, len(spec.Rules))
+	seenIDs := make(map[string]struct{}, len(spec.Rules))
+	auditBytes := 0
+	for _, source := range spec.Rules {
+		if !validID(source.ID) {
+			return nil, errors.New("git rule has an invalid id")
+		}
+		if _, duplicate := seenIDs[source.ID]; duplicate {
+			return nil, errors.New("git rule ids must be unique")
+		}
+		seenIDs[source.ID] = struct{}{}
+		auditBytes += len(source.ID)
+		if len(seenIDs) > 1 {
+			auditBytes++
+		}
+		if auditBytes > 1024 {
+			return nil, errors.New("git rule ids exceed the audit metadata limit")
+		}
+		if source.Effect != gitadapter.EffectAllow && source.Effect != gitadapter.EffectDeny {
+			return nil, errors.New("git rule effect must be allow or deny")
+		}
+		if source.Operation != gitadapter.OperationFetch && source.Operation != gitadapter.OperationPush {
+			return nil, errors.New("git rule operation must be fetch or push")
+		}
+		repositories, err := compileGitStringMatchers(source.Repositories, true, repositoryCase)
+		if err != nil {
+			return nil, fmt.Errorf("git rule %s repositories: %w", source.ID, err)
+		}
+		refs, err := compileGitStringMatchers(source.Refs, false, repositoryCase)
+		if err != nil {
+			return nil, fmt.Errorf("git rule %s refs: %w", source.ID, err)
+		}
+		if source.Operation == gitadapter.OperationFetch && (len(source.Refs) != 0 || len(source.UpdateKinds) != 0) {
+			return nil, errors.New("fetch rules cannot claim ref-level confidentiality")
+		}
+		if source.Operation == gitadapter.OperationPush && source.Effect == gitadapter.EffectAllow && (len(source.Refs) == 0 || len(source.UpdateKinds) == 0) {
+			return nil, errors.New("allow push rules require explicit refs and update_kinds")
+		}
+		seenKinds := make(map[gitadapter.UpdateKind]struct{}, len(source.UpdateKinds))
+		for _, kind := range source.UpdateKinds {
+			if kind != gitadapter.UpdateCreate && kind != gitadapter.UpdateModify && kind != gitadapter.UpdateDelete {
+				return nil, errors.New("git update kind must be create, update, or delete")
+			}
+			if _, duplicate := seenKinds[kind]; duplicate {
+				return nil, errors.New("git update kinds must be unique")
+			}
+			seenKinds[kind] = struct{}{}
+		}
+		rule := gitadapter.Rule{
+			ID: source.ID, Effect: source.Effect, Repositories: repositories,
+			Operations: []gitadapter.Operation{source.Operation}, Refs: refs,
+			UpdateKinds: append([]gitadapter.UpdateKind(nil), source.UpdateKinds...),
+		}
+		if source.Operation == gitadapter.OperationFetch {
+			rule.Services = []gitadapter.Service{gitadapter.ServiceUploadPack}
+		} else {
+			rule.Services = []gitadapter.Service{gitadapter.ServiceReceivePack}
+			rule.ProtocolVersions = []int{0, 1}
+			if source.Effect == gitadapter.EffectAllow {
+				rule.Signed = gitadapter.Bool(false)
+				rule.HasPushOptions = gitadapter.Bool(false)
+			}
+		}
+		compiled = append(compiled, rule)
+	}
+	return gitadapter.NewPolicy(compiled)
+}
+
+// compileGitStringMatchers accepts exact values and one deliberately small
+// recursive form: "prefix/**". A lone "**" is an explicit match-all. There is
+// request identities are normalized according to the service's explicit case
+// mode before this byte-for-byte matcher is evaluated.
+func compileGitStringMatchers(patterns []string, repository bool, repositoryCase gitadapter.RepositoryCaseMode) ([]gitadapter.StringMatcher, error) {
+	if repository && len(patterns) == 0 {
+		return nil, errors.New("at least one repository pattern is required")
+	}
+	if len(patterns) > 256 {
+		return nil, errors.New("too many patterns")
+	}
+	seen := make(map[string]struct{}, len(patterns))
+	result := make([]gitadapter.StringMatcher, 0, len(patterns))
+	for _, pattern := range patterns {
+		if repository {
+			var err error
+			pattern, err = gitadapter.NormalizeRepository(pattern, repositoryCase)
+			if err != nil {
+				return nil, errors.New("repository pattern is incompatible with repository_case")
+			}
+		}
+		if _, duplicate := seen[pattern]; duplicate {
+			return nil, errors.New("duplicate pattern")
+		}
+		seen[pattern] = struct{}{}
+		if pattern == "**" {
+			if len(patterns) != 1 {
+				return nil, errors.New("match-all must be the only pattern")
+			}
+			return nil, nil
+		}
+		if pattern == "" || len(pattern) > 1024 || strings.ContainsAny(pattern, "\\%?#\x00\r\n") || strings.Contains(pattern, "//") || strings.Contains(pattern, "*") && !strings.HasSuffix(pattern, "/**") {
+			return nil, errors.New("invalid pattern")
+		}
+		if strings.HasSuffix(pattern, "/**") {
+			prefix := strings.TrimSuffix(pattern, "**")
+			if err := validateGitPatternValue(prefix+gitPatternSample(repository), repository); err != nil {
+				return nil, err
+			}
+			result = append(result, gitadapter.StringMatcher{Prefix: prefix})
+			continue
+		}
+		if err := validateGitPatternValue(pattern, repository); err != nil {
+			return nil, err
+		}
+		result = append(result, gitadapter.StringMatcher{Exact: pattern})
+	}
+	return result, nil
+}
+
+func gitPatternSample(repository bool) string {
+	if repository {
+		return "repository.git"
+	}
+	return "ref"
+}
+
+func validateGitPatternValue(value string, repository bool) error {
+	if !utf8.ValidString(value) || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") {
+		return errors.New("pattern is not canonical")
+	}
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || component == "." || component == ".." {
+			return errors.New("pattern is not canonical")
+		}
+	}
+	if repository {
+		if !strings.HasSuffix(value, ".git") {
+			return errors.New("repository patterns must resolve to .git paths")
+		}
+		for _, current := range value {
+			if unicode.IsControl(current) || unicode.Is(unicode.Cf, current) || unicode.Is(unicode.Zl, current) || unicode.Is(unicode.Zp, current) {
+				return errors.New("repository pattern contains an unsafe character")
+			}
+		}
+		return nil
+	}
+	if err := gitadapter.ValidateRefName(value); err != nil {
+		return errors.New("ref pattern is not a valid full ref")
+	}
+	return nil
+}
+
+func gitPolicyRevision(spec PolicyConfig, repositoryCase gitadapter.RepositoryCaseMode) (string, error) {
+	rules := append([]GitRuleConfig(nil), spec.Git.Rules...)
+	for index := range rules {
+		rules[index].Repositories = append([]string(nil), rules[index].Repositories...)
+		rules[index].Refs = append([]string(nil), rules[index].Refs...)
+		rules[index].UpdateKinds = append([]gitadapter.UpdateKind(nil), rules[index].UpdateKinds...)
+		sort.Strings(rules[index].Repositories)
+		sort.Strings(rules[index].Refs)
+		sort.Slice(rules[index].UpdateKinds, func(i, j int) bool { return rules[index].UpdateKinds[i] < rules[index].UpdateKinds[j] })
+	}
+	sort.Slice(rules, func(i, j int) bool { return rules[i].ID < rules[j].ID })
+	material := struct {
+		Engine            string
+		Service           string
+		CapabilitySummary string
+		RepositoryCase    gitadapter.RepositoryCaseMode
+		Rules             []GitRuleConfig
+	}{
+		Engine: "forcefield-git-policy/v1", Service: spec.Service,
+		CapabilitySummary: spec.CapabilitySummary, RepositoryCase: repositoryCase, Rules: rules,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -997,6 +1300,27 @@ func validHeader(auth HeaderAuth) bool {
 
 func validAuthHeader(auth HeaderAuth) bool {
 	return validHeader(auth) && !isHopHeader(auth.Header) && !isFramingHeader(auth.Header) && !strings.EqualFold(auth.Header, "Host")
+}
+
+func validBasicUsername(value string) bool {
+	if value == "" || len(value) > 256 || tokens.ContainsBearer(value) {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < 0x21 || value[index] > 0x7e || value[index] == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func gitDerivedHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "git-protocol", "content-type", "content-encoding", "accept-encoding", "content-length", "transfer-encoding":
+		return true
+	default:
+		return false
+	}
 }
 
 func isFramingHeader(name string) bool {

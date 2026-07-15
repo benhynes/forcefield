@@ -58,16 +58,21 @@ For each request Forcefield performs these operations in order:
 5. Resolve exactly one concrete grant for the routed service. Its credential,
    policy revision, and security-binding revision must still match the loaded
    service.
-6. Atomically charge the matching grant at every token in the delegation chain,
-   buffer the request body under the finite global/grant/policy ceiling, recheck
-   late trailers, and evaluate policy over the service-relative canonical target.
+6. Atomically charge the matching grant at every token in the delegation chain
+   and invoke the service adapter. The HTTP adapter buffers the body under the
+   finite global/grant/policy ceiling and evaluates the canonical target. The
+   Git adapter classifies one exact smart-HTTP route; fetch is authorized for
+   the repository as a whole, while receive-pack parses and authorizes every ref
+   update before opening an upstream request. Git pack data then streams under
+   the global/grant body and byte ceilings. Late trailers fail closed.
 7. Append an allow record before any secret is fetched. With the default
    `audit_failure: closed`, an audit error stops the request here. Revalidate
    the immutable token/grant before and after the potentially slow secret lookup.
 8. Resolve the credential reference, create outbound headers only from the
    configured allowlist, add operator-controlled static headers, inject the
-   credential with `Set` semantics, and send the request using the service's
-   direct hardened transport.
+   credential with `Set` semantics (or the configured upstream Basic-password
+   transform), and send the request using the service's direct hardened
+   transport.
 9. Strip risky response headers, validate or rewrite redirects, scan response
    headers for the exact secret, reject any non-final status outside 200--599,
    and stream an exact-secret-filtered body.
@@ -114,9 +119,9 @@ The ordinary request lifecycle remains the enforcement boundary.
 These are separate because each is a different security decision:
 
 ```text
-service     = route + pinned upstream + transport + client token carrier
+service     = adapter + route + pinned upstream + transport + client token carrier
 credential  = service + host secret reference + upstream header injection
-policy      = service + immutable compiled matcher revision
+policy      = service + adapter-specific immutable matcher revision
 binding     = revision of security-relevant service/credential configuration
 grant       = service + credential + policy + binding revisions + ceilings
 role        = named template containing one or more grants
@@ -163,7 +168,7 @@ The outbound transport:
 destination list supplied by the caller. SPKI pinning is additive: it does not
 turn off normal certificate verification.
 
-## Header adapter
+## HTTP header adapter
 
 The v1 adapter separates the broker-token carrier from the real-credential
 carrier. For example, an agent can send `Authorization: Bearer ff_...` while
@@ -184,6 +189,97 @@ value, while credential `Set` semantics prevent duplicate-header smuggling.
 This adapter is intentionally small. It handles only a static value injected in
 one header. It does not sign a request, perform an auth challenge, mint native
 temporary credentials, or rewrite a request body.
+
+## Git smart-HTTP adapter
+
+`adapter: git-smart-http` is a protocol adapter, not a provider adapter. It can
+front any pinned upstream that implements Git smart HTTP and accepts a static
+HTTP credential. No repository owner, branch name, or hosting product is built
+into the adapter. Those choices live entirely in configuration policy.
+
+Every Git service must declare `git.repository_case`. `sensitive` preserves the
+canonical repository URL path byte-for-byte and is appropriate only when the
+upstream treats case-distinct paths as distinct repository identities.
+`ascii-insensitive` rejects non-ASCII repository paths and folds ASCII `A`--`Z`
+to lowercase for policy, as it must when the upstream maps ASCII case variants
+to one repository. Repository patterns are normalized the same way. This mode
+affects repository URL identity only; ref names remain case-sensitive.
+
+The case mode is an operator assertion about upstream routing, not an upstream
+discovery mechanism. Other aliases are not collapsed. If an upstream maps an
+old name, renamed path, vanity alias, or Unicode-normalized spelling to the same
+physical repository, those URLs must not receive different Forcefield
+authority. Remove the aliases or apply identical repository rules to every URL
+name; otherwise an allowed alias can bypass a deny written for another name.
+
+The adapter exposes only these service-relative request shapes, where
+`REPOSITORY` is a canonical, possibly nested path ending in `.git`:
+
+| Request | Meaning |
+|---|---|
+| `GET /REPOSITORY/info/refs?service=git-upload-pack` | Fetch discovery. |
+| `POST /REPOSITORY/git-upload-pack` with `application/x-git-upload-pack-request` | Fetch RPC. |
+| `GET /REPOSITORY/info/refs?service=git-receive-pack` | Push discovery. |
+| `POST /REPOSITORY/git-receive-pack` with `application/x-git-receive-pack-request` | Push RPC. |
+
+The path-route prefix is removed before classification. Methods, query spelling,
+RPC content types, and successful upstream Git response types must be exact.
+Consequently, dumb-HTTP paths such as `HEAD` and `objects/**`, Git LFS HTTP
+paths, extra queries, and unrelated hosting APIs never reach the upstream
+through this adapter.
+
+Fetch authorization is deliberately repository-wide. Upload-pack object wants
+cannot be treated as a confidentiality boundary for one advertised branch, so
+a fetch rule may select repositories but may not claim ref-level restrictions.
+An allowed fetch can obtain every object the upstream repository and its own
+server-side policy make available.
+
+Push authorization is semantic. Forcefield parses the bounded pkt-line command
+prefix before credential access, derives `create`, `update`, or `delete` from
+the old/new object IDs, validates each full `refs/...` name, and evaluates each
+update independently. Any matching deny rejects the whole multi-ref request;
+otherwise every update must match an allow. This is default deny, deny-wins,
+and independent of rule order. Repository and ref selectors are exact strings
+or recursive `prefix/**` patterns, so a deployment can protect
+`refs/heads/stable`, `refs/tags/**`, or any other ref without a hardcoded
+`main`-branch concept.
+
+The receive-pack command does not say whether an ordinary update is a
+fast-forward. Both a fast-forward and a forced non-fast-forward arrive as the
+same old object ID, new object ID, and ref; proving ancestry would require
+repository object-graph access. Forcefield therefore does not offer a fictional
+`force` update kind. Use upstream branch protection or receive-pack controls to
+deny non-fast-forwards, and use Forcefield to constrain repositories, refs, and
+observable create/update/delete operations.
+
+Likewise, policy covers the ref commands visible on the receive-pack wire, not
+effects invented later by the upstream. A `proc-receive`, pre-receive,
+post-receive, or other server hook must not translate an allowed command into an
+update or privileged side effect on an unauthorized ref or repository. Such
+hooks and their configuration are part of the trusted upstream boundary.
+
+Git clients can present `ff_` tokens as HTTP Basic passwords through the bundled
+path-scoped `ff git-credential` helper. That guest-side challenge flow is
+separate from upstream authentication. Upstream injection can remain an
+ordinary header prefix or set `basic_username`, which encodes the host-side
+secret as that username's Basic password. Neither form exposes the upstream
+credential to the Git client. For Basic injection, the response filter scans
+both the raw secret and the exact base64-encoded `username:secret` payload.
+
+Upload-pack request bodies and receive-pack pack data stream rather than being
+buffered wholesale. Receive-pack buffers at most a bounded command prefix,
+authorizes it, and replays the exact bytes into the stream. Identity, `gzip`,
+and `x-gzip` RPC bodies are accepted; gzip is decoded before authorization and
+forwarding, with compressed and decoded size bounds, a decompression-ratio
+guard, byte-budget charging on decoded bytes, and rejection of concatenated or
+trailing streams. A limit failure aborts the upstream RPC. Request trailers are
+rejected.
+
+Fetch supports protocol v0, v1, and v2. Git has no supported protocol-v2 push
+flow here: a v2 advertisement header on receive-pack discovery is stripped so
+ordinary clients can fall back to v0, while a v2 receive-pack RPC is denied.
+Push certificates and push options are also denied. These restrictions keep the
+policy input to the command form Forcefield actually parses.
 
 ## Response boundary
 
@@ -220,10 +316,10 @@ adapter:
 - **AWS SigV4:** requires a signer that hashes and signs the exact canonical
   request, or a credential-vending endpoint that returns narrowly scoped,
   short-lived native credentials. Static header replacement is incorrect.
-- **`gh` and Git:** `gh` has host and credential-selection behavior beyond a
-  simple arbitrary API base URL, while Git smart HTTP includes discovery,
-  redirects, and credential-helper conventions. Build explicit `gh`/Git
-  integration and test every redirect and auth challenge.
+- **`gh` and Git extensions:** `gh` has host and credential-selection behavior
+  beyond a simple arbitrary API base URL. Git LFS, dumb HTTP, signed pushes,
+  push options, and protocol-v2 push are outside the smart-HTTP adapter's
+  deliberately small surface and need explicit designs before support.
 - **OCI/Docker registries:** the bearer challenge and token-service exchange
   create multiple pinned authorities and scope negotiation. This needs a
   registry adapter, not a permissive second destination.

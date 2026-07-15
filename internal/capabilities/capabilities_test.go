@@ -148,6 +148,28 @@ func TestRenderMarkdownIsBoundedAndNeverContainsBearer(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownExplainsGitSmartHTTPHelper(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	manifest := Manifest{
+		Version: SchemaVersion, GeneratedAt: now, ExpiresAt: now.Add(time.Hour),
+		Services: []Service{{
+			Name: "git", Adapter: config.AdapterGitSmartHTTP,
+			BaseURL: "https://forcefield.example/git", PathPrefix: "/git",
+			Auth: Auth{Header: "Authorization", Prefix: "Bearer "},
+		}},
+	}
+	text, err := RenderMarkdown(manifest, RenderOptions{Now: now, TokenFile: "/run/forcefield/token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Git smart HTTP only", "ff git-credential", "useHttpPath", "repository URLs must end in .git"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("Git capability context omitted %q: %s", expected, text)
+		}
+	}
+}
+
 func TestRenderMarkdownPageCoversEveryServiceWithinToolBound(t *testing.T) {
 	t.Parallel()
 	now := time.Now().UTC()
@@ -366,22 +388,36 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
-func TestClaudeHookRoundTrip(t *testing.T) {
+func TestAgentHookRoundTrip(t *testing.T) {
 	t.Parallel()
-	event, err := ReadClaudeHookEvent(strings.NewReader(`{"hook_event_name":"SubagentStart","future_field":true}`))
-	if err != nil || event != "SubagentStart" {
-		t.Fatalf("event=%q err=%v", event, err)
-	}
-	var output bytes.Buffer
-	if err := WriteClaudeHook(&output, event, "capabilities\n"); err != nil {
-		t.Fatal(err)
-	}
-	var decoded map[string]map[string]string
-	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded["hookSpecificOutput"]["hookEventName"] != event || decoded["hookSpecificOutput"]["additionalContext"] != "capabilities\n" {
-		t.Fatalf("output = %s", output.Bytes())
+	for runtime, functions := range map[string]struct {
+		read  func(io.Reader) (string, error)
+		write func(io.Writer, string, string) error
+		input string
+	}{
+		"Claude": {ReadClaudeHookEvent, WriteClaudeHook, `{"hook_event_name":"SubagentStart","future_field":true}`},
+		"Codex": {ReadCodexHookEvent, WriteCodexHook,
+			`{"session_id":"session","turn_id":"turn","agent_id":"agent","agent_type":"worker","cwd":"/workspace","model":"gpt","permission_mode":"default","hook_event_name":"SubagentStart"}`},
+	} {
+		runtime, functions := runtime, functions
+		t.Run(runtime, func(t *testing.T) {
+			t.Parallel()
+			event, err := functions.read(strings.NewReader(functions.input))
+			if err != nil || event != "SubagentStart" {
+				t.Fatalf("event=%q err=%v", event, err)
+			}
+			var output bytes.Buffer
+			if err := functions.write(&output, event, "capabilities\n"); err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]map[string]string
+			if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded["hookSpecificOutput"]["hookEventName"] != event || decoded["hookSpecificOutput"]["additionalContext"] != "capabilities\n" {
+				t.Fatalf("output = %s", output.Bytes())
+			}
+		})
 	}
 }
 

@@ -13,6 +13,8 @@ import (
 
 const capabilityMCPToolName = "capabilities"
 
+const capabilityMCPInstructions = "External-service access is brokered by Forcefield. Consult the capabilities tool before planning or making external API calls and whenever startup context may be stale; follow every returned cursor. Use only advertised Forcefield origins. Never reveal or send the Forcefield token or mTLS private key except as Forcefield client inputs. Remaining quota is not reported, and a 404 may mean outside the grant. Snapshots are advisory; Forcefield remains authoritative."
+
 var errCapabilityMCP = errors.New("Forcefield capability lookup was not confirmed")
 
 type capabilityMCPInput struct {
@@ -49,7 +51,7 @@ func runMCP(args []string, stdin io.Reader, stdout io.Writer) error {
 func newCapabilityMCPServer(options capabilities.ClientOptions, fetch capabilityFetcher) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name: "forcefield", Title: "Forcefield capabilities", Version: version,
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: capabilityMCPInstructions})
 	closedWorld := false
 	mcp.AddTool(server, &mcp.Tool{
 		Meta:  mcp.Meta{"anthropic/alwaysLoad": true},

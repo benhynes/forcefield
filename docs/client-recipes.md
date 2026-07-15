@@ -209,6 +209,80 @@ Again, prefer an explicit constructor when possible and verify the particular
 SDK version. Never leave a fallback provider key in the same environment; a
 base-URL mistake could otherwise send it directly.
 
+## Git smart HTTP
+
+For a service configured with `adapter: git-smart-http`, use its advertised
+Forcefield service URL as the Git remote. The bundled credential helper reads a
+0600 token file only when Git asks for credentials under that exact
+scheme/host/path prefix. It returns the fixed username `forcefield` and the
+`ff_` bearer as the HTTP Basic password; the upstream Git credential remains on
+the trusted host.
+
+Provision this scoped configuration in the guest's `~/.gitconfig` (substitute
+the actual service URL and paths):
+
+```gitconfig
+[credential "https://forcefield.internal:7902/git"]
+    useHttpPath = true
+    helper = !ff git-credential --url https://forcefield.internal:7902/git --token-file /run/forcefield/token
+
+[http "https://forcefield.internal:7902/git"]
+    sslCAInfo = /run/forcefield/ca.crt
+    sslCert = /run/forcefield/client.crt
+    sslKey = /run/forcefield/client.key
+```
+
+`credential.useHttpPath` is important: without it Git omits the URL path from
+credential lookup, and the helper intentionally refuses to widen `/git` into a
+host-wide credential. The helper implements `get` but deliberately ignores
+`store` and `erase`; it never copies the bearer out of its separately delivered
+token file. Avoid configuring another caching helper for the same URL, because
+that other helper could persist the returned Forcefield bearer.
+
+Clone and push normally:
+
+```sh
+export FORCEFIELD_GIT_URL=https://forcefield.internal:7902/git
+
+git clone "$FORCEFIELD_GIT_URL/engineering/application.git"
+cd application
+git switch -c agent/topic
+git push origin HEAD:refs/heads/agent/topic
+```
+
+On a valid smart-HTTP route, the initial unauthenticated request receives a
+Basic challenge and Git invokes the helper. Invalid routes and authorization
+denials remain opaque. The helper is URL-scoped, and Forcefield rechecks the
+token's workload, expiry, concrete grant, policy revision, and budgets on every
+discovery and RPC request.
+
+Repository URL spelling follows the service's required
+`git.repository_case`. In `ascii-insensitive` mode, ASCII case variants share a
+lowercase policy identity and non-ASCII repository paths are denied;
+`sensitive` preserves case for an upstream that really treats those paths as
+different repositories. This is not alias discovery. Operators must not expose
+old names, rename aliases, vanity paths, or redirects that map differently
+authorized URL names to the same physical repository.
+
+A fetch grant authorizes the repository as a whole, not selected branches.
+Push policy is finer-grained: every receive-pack update is classified as
+`create`, `update`, or `delete`, every update must match an allow, and one
+matching deny rejects the whole multi-ref push. For example, a deployment may
+allow `refs/heads/**` while denying `refs/heads/stable`; neither that name nor
+`main` is built into Forcefield.
+
+Git does not label an ordinary update as fast-forward or force. Enforce
+non-fast-forward restrictions with the upstream's branch protection or
+receive-pack configuration. Forcefield enforces the repository/ref/update
+policy it can prove from the wire request.
+
+Pack bodies stream under `server.max_request_bytes`, the grant's
+`max_request_bytes`, `byte_budget`, and the request read deadline. Git's gzip
+request form is decoded, bounded, and forwarded as identity. Set these limits
+for the largest intended push. Git LFS, dumb HTTP, push certificates, push
+options, and protocol-v2 push are not supported; use ordinary protocol fallback
+and do not route those other endpoints through this adapter.
+
 ## mTLS from SDKs
 
 SDKs commonly use an HTTP client such as `httpx` underneath. Configure that
@@ -229,9 +303,11 @@ Do not point these at the generic header adapter and assume equivalence:
 
 - AWS SDKs sign the request with SigV4. They need an exact-request signer or a
   native temporary-credential vending adapter.
-- `gh` and Git may use host-specific configuration, credential helpers, smart
-  HTTP discovery, and redirects. A raw GitHub REST curl working does not prove
-  `gh` or `git clone` is supported.
+- `gh` has host-specific configuration and authentication behavior beyond a
+  generic REST base URL. A raw GitHub REST curl or Git smart-HTTP clone does not
+  prove `gh` is supported.
+- Git LFS, dumb HTTP, signed pushes, push options, and protocol-v2 push need
+  explicit adapter support beyond the current Git smart-HTTP surface.
 - Docker/OCI clients follow registry challenge and token-exchange flows across
   multiple authorities.
 - SSH needs a separate adapter that issues a short-lived SSH certificate or a

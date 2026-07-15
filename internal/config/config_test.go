@@ -70,6 +70,9 @@ func TestDecodeAndCompile(t *testing.T) {
 	if compiled.PoliciesByRevision[grant.PolicyRevision].Name != "github-read" {
 		t.Fatal("policy revision was not indexed")
 	}
+	if compiled.File.Services["github"].Adapter != AdapterHTTP {
+		t.Fatal("legacy service did not default to the HTTP adapter")
+	}
 }
 
 func TestBindingRevisionInvalidatesRetargetedCredential(t *testing.T) {

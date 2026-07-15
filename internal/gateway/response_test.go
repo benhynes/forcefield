@@ -79,6 +79,22 @@ func TestResponseGuardBlocksHeaderReflection(t *testing.T) {
 	}
 }
 
+func TestResponseGuardBlocksDerivedCredentialReflection(t *testing.T) {
+	t.Parallel()
+	upstream, _ := url.Parse("https://git.example.com")
+	derived := []byte("YnJva2VyOnVwc3RyZWFtLXRva2Vu")
+	resp := &http.Response{
+		Header: make(http.Header),
+		Body:   io.NopCloser(strings.NewReader("prefix-" + string(derived) + "-suffix")),
+	}
+	if err := (ResponseGuard{Upstream: upstream}).GuardPatterns(resp, [][]byte{[]byte("upstream-token"), derived}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(resp.Body); !errors.Is(err, ErrSecretReflection) {
+		t.Fatalf("derived credential reflection error = %v", err)
+	}
+}
+
 func TestResponseGuardBlocksSecretHeaderNameAndAmbiguousEncoding(t *testing.T) {
 	t.Parallel()
 	upstream, _ := url.Parse("https://api.example.com")

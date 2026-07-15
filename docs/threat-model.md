@@ -21,6 +21,9 @@ upstream response.
 - Duplicate parameters, duplicate authentication headers, path confusion,
   duplicate/invalid representation headers, late trailers, encoded separators,
   redirect leakage, header smuggling, SSRF, and use of host proxy settings.
+- Malformed Git smart-HTTP routes, pkt-line framing, object IDs, ref names,
+  duplicate or mixed-authority ref updates, compressed packs, and attempts to
+  smuggle an unauthorized update inside a multi-ref push.
 - An agent attempting to enumerate routes, token validity, grants, or policy
   failures.
 - A secret backend failure, policy evaluation error, audit failure, malformed
@@ -46,7 +49,8 @@ upstream response.
   policy allows, including malicious uses of those operations. Forcefield does
   not infer intent, inspect prompts, or approve business semantics.
 - Availability is not guaranteed against a client authorized to consume its
-  request/bandwidth allowance or an upstream that streams indefinitely.
+  request/bandwidth allowance, a large permitted Git pack, or an upstream that
+  streams indefinitely.
 
 ## Workload authentication
 
@@ -143,6 +147,10 @@ addresses while retaining TLS SNI/certificate validation for the configured
 hostname. Private and special-purpose ranges are denied unless explicitly
 listed. Outbound proxy environment variables are ignored.
 
+The Git adapter likewise does not turn a repository path into a destination.
+Its four smart-HTTP route shapes are relative to the service's one configured
+upstream. Dumb HTTP, Git LFS, and provider API paths do not match those shapes.
+
 Residual risks include compromise of DNS plus a valid certificate, an overly
 broad `allowed_cidrs` exception, a bad configured hostname, a compromised
 public upstream, and application-layer behavior inside an allowed endpoint.
@@ -172,11 +180,85 @@ Policy still has semantic blind spots:
   deny, which can also cause availability failures. JSON-to-CEL conversion is
   lazy: unrelated decimals are harmless, while an inspected decimal that has
   no exact binary `double` representation fails closed instead of rounding.
+- Git fetch rules authorize a repository as a whole, not branch-level object
+  confidentiality. Git push rules can prove the repository, full ref, and
+  create/update/delete shape of each command, but not whether an update is a
+  fast-forward or what the new objects mean.
 - A provider can assign new semantics to an already allowed endpoint without a
   Forcefield configuration change.
 
 Use purpose-built adapters for high-impact operations where it is important to
 pin fields rather than merely test them.
+
+## Git smart-HTTP boundary
+
+The Git adapter is generic: it contains no hosting-provider, repository-class,
+or protected-branch name. Operator policy supplies exact or recursive
+repository/ref selectors. A rule can deny `refs/heads/stable`, allow it, or
+protect a completely different ref. This separation matters because a
+deployment convention such as “infrastructure cannot push to main” is not a
+Forcefield invariant.
+
+Repository policy operates on URL identity, so every Git service requires an
+operator-selected case model. `sensitive` preserves repository path bytes and
+is safe only when the upstream distinguishes case variants.
+`ascii-insensitive` lowercases ASCII for both requests and policy and rejects
+non-ASCII paths; it is safe only when the upstream folds those same ASCII case
+variants. Choosing `sensitive` for a case-insensitive upstream can let a case
+alias evade an exact deny. Choosing `ascii-insensitive` for a case-sensitive
+upstream can conflate distinct repositories and grant one the other's
+authority.
+
+Case handling does not solve arbitrary aliases. An upstream must not map an old
+name, renamed path, redirect, vanity alias, or alternate normalization to the
+same physical repository while Forcefield gives those URL names different
+authority. Forcefield has no trusted upstream repository-ID oracle with which
+to prove they are the same. Remove such aliases or apply identical repository
+authorization to every accepted URL name.
+
+Fetch authorization is repository-wide. Upload-pack clients choose object
+wants, and advertised refs are not a sufficient confidentiality boundary for
+reachable or otherwise obtainable objects. Forcefield therefore rejects Git
+fetch rules that claim `refs` or update kinds. Put differently protected read
+audiences in different repositories or enforce object visibility upstream.
+
+For pushes, Forcefield parses and validates the receive-pack command prefix
+before credential lookup. Every command is classified as `create`, `update`,
+or `delete`; every update must match an allow; and a deny on any update rejects
+the entire request before it reaches the upstream. Duplicate refs, malformed
+object IDs/ref names, unsupported capabilities, oversized command prefixes,
+and ambiguous protocol forms fail closed. This prevents an allowed update from
+masking a denied update in the same request.
+
+Authorization ends at the wire-visible command tuple. A trusted upstream
+`proc-receive`, pre-receive, post-receive, or other hook must not reinterpret an
+allowed command as an update or privileged effect on an unauthorized ref or
+repository. A hook that does so acts with the broader upstream credential after
+Forcefield's decision and defeats the intended semantic boundary. Audit and
+review upstream hooks as part of the trusted configuration.
+
+An `update` command contains only old object ID, new object ID, and ref. It does
+not assert or prove ancestry, so Forcefield cannot distinguish a fast-forward
+from a forced non-fast-forward without acquiring and trusting the repository
+object graph. It intentionally exposes no `force` selector. Configure upstream
+branch protection or receive-pack non-fast-forward controls as defense in
+depth. The upstream credential itself may be broader than the Forcefield grant,
+so native protections remain valuable if the gateway or host is compromised.
+
+Receive-pack supports the command forms Forcefield parses: protocol v0/v1,
+without push certificates or push options. Protocol-v2 receive-pack, signed
+pushes, Git LFS, and dumb HTTP are outside the adapter. Receive-pack discovery
+strips a v2 request so ordinary Git clients can fall back rather than treating
+an unimplemented v2 push as authorized semantics.
+
+Pack bodies stream after authorization instead of being retained in memory.
+Both compressed and decoded sizes are bounded; gzip has a decompression-ratio
+guard and rejects concatenated/trailing streams; decoded bytes are charged to
+every delegation-chain byte budget as they are consumed. A mid-stream limit,
+timeout, malformed pack, or transport error can leave the client with an
+aborted RPC. Forcefield relies on receive-pack not applying a partial invalid
+pack, while upstream atomic branch-update policy remains the provider's
+responsibility.
 
 ## Response reflection and a malicious upstream
 
@@ -184,8 +266,9 @@ The response guard removes common credential-bearing headers, rejects
 cross-origin redirects, rewrites accepted same-origin redirects through the
 gateway, rejects non-identity content encoding by default, scans remaining
 headers, and searches a streamed response across chunk boundaries for the exact
-credential bytes. A non-final 1xx response (including 101) or invalid status
-above 599 is rejected rather than relayed.
+credential bytes. For `basic_username` injection it also scans the exact
+base64-encoded `username:secret` payload. A non-final 1xx response (including
+101) or invalid status above 599 is rejected rather than relayed.
 
 This does **not** establish that the real credential can never reach the VM
 regardless of upstream behavior. A malicious or compromised upstream can return
@@ -250,10 +333,11 @@ bodies, raw bearers, or credential fields.
 Token persistence is crash-conscious and bearer-free. A held cross-process
 lock on supported platforms prevents multiple servers from sharing one token
 file, and inactive records/subtrees are durably pruned on open and mutation.
-Request bodies are always buffered under a finite configured ceiling, so
-request streaming is not supported. Numeric budgets and rate state are not
-persisted and reset on restart. If those are hard security quotas, enforce them
-again at the provider or an external durable accounting layer.
+The HTTP adapter buffers bodies under a finite configured ceiling; Git
+smart-HTTP streams bounded RPC bodies after semantic prefix authorization.
+Numeric budgets and rate state are not persisted and reset on restart. If those
+are hard security quotas, enforce them again at the provider or an external
+durable accounting layer.
 
 ## Operational checklist
 
@@ -264,6 +348,10 @@ again at the provider or an external durable accounting layer.
 - Keep fail-closed auditing and monitor the process and audit-file filesystem.
 - Forward only the headers the API requires.
 - Exercise both expected allows and adversarial denies before minting live tokens.
+- For Git, test mixed multi-ref pushes and configure upstream branch protection
+  for ancestry/merge constraints Forcefield cannot infer.
+- Match `git.repository_case` to upstream routing, remove differently
+  authorized repository aliases, and audit receive hooks for ref rewrites.
 - Retain old policy revisions during a controlled migration or revoke/re-mint.
 - Keep capability hooks/MCP root-managed and treat injected grant text as
   advisory, never as authorization.

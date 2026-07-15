@@ -3,26 +3,27 @@
 An agent should not need a user to recite its grants. Forcefield provides an
 authenticated, freshly generated projection of revision-current configured
 grants, and the guest's agent runtime can inject that projection automatically.
-This is a usability layer, not an
-authorization layer: Forcefield still evaluates every request against the
-token, workload identity, current policy and binding revisions, and remaining
-token lifetime.
+This is a usability layer, not an authorization layer: Forcefield still
+evaluates every request against the token, workload identity, current policy
+and binding revisions, and remaining token lifetime.
 
-The recommended Claude Code integration has three parts:
+The supplied Claude Code and Codex CLI integrations have three parts:
 
-1. Managed static instructions tell every agent that Forcefield exists, that a
-   startup snapshot is advisory, and that the refresh tool is
-   `mcp__forcefield__capabilities`.
-2. Managed `SessionStart` and `SubagentStart` hooks run `ff capabilities
-   --format claude-hook`. The hook output is inserted into the new agent's
-   context, including on resume/compaction and for spawned subagents.
-3. A local `ff mcp` stdio server exposes a single `capabilities` tool. The
-   agent can refresh the configured-grant view before an external call when staleness would
-   matter.
+1. Administrator-managed `SessionStart` and `SubagentStart` hooks run `ff
+   capabilities` in the runtime's hook format. The result is inserted into
+   every new agent's context, including on resume/compaction and for spawned
+   subagents.
+2. A local `ff mcp` stdio server exposes one `capabilities` tool so the agent
+   can refresh the configured-grant view before an external call when
+   staleness would matter.
+3. Automatically loaded runtime guidance explains that Forcefield exists, that
+   snapshots are advisory, and how to handle the bearer and mTLS key. Claude
+   uses managed `claudeMd`; Codex consumes the MCP server's initialization
+   instructions directly.
 
-Do not paste a bearer into `CLAUDE.md`, settings, hook commands, MCP JSON, or a
-generated manifest. Both integrations point to a protected token file and the
-`ff` process reads it without returning its value.
+Do not paste a bearer into `CLAUDE.md`, `AGENTS.md`, settings, hook commands,
+MCP configuration, or a generated manifest. Every integration points to a
+protected token file and the `ff` process reads it without returning its value.
 
 ## Live capability endpoint
 
@@ -153,6 +154,48 @@ fresh capability information comes from and how bearer material may be used.
 Do not generate a long-lived grant list into `CLAUDE.md`; revocation and
 configuration rollout can make it stale.
 
+## Codex CLI managed hook
+
+Codex CLI supports `SessionStart` and `SubagentStart` hooks with the same
+structured context wire format. Forcefield exposes that contract explicitly as
+`ff capabilities --format codex-hook`; extra Codex event fields are ignored.
+
+Adapt
+[`deploy/codex/forcefield-capabilities-hook.example`](../deploy/codex/forcefield-capabilities-hook.example),
+then install it root-owned, non-writable by the agent user, and mode `0755` as:
+
+```text
+/etc/codex/hooks/forcefield-capabilities
+```
+
+Merge
+[`deploy/codex/requirements.toml.merge.example`](../deploy/codex/requirements.toml.merge.example)
+into the guest's existing `/etc/codex/requirements.toml`. Do not replace other
+administrator requirements. The example pins the stable `hooks` feature on,
+declares `/etc/codex/hooks` as its managed script directory, and injects a live
+snapshot for startup, resume, clear, compaction, and every subagent start.
+Because the hook command is a shell string in Codex, the supplied requirements
+call a fixed wrapper with no arguments; keep that wrapper and every value
+embedded in it administrator-controlled.
+
+The hardened example sets `allow_managed_hooks_only = true`. That prevents
+user, repository, session, and plugin hooks from presenting a contradictory
+capability story, but also disables every legitimate hook from those sources.
+Install any other required hooks through managed configuration or deliberately
+remove that setting after reviewing the tradeoff. Managed requirements hooks
+are trusted automatically and cannot be disabled through Codex's `/hooks`
+browser.
+
+See the current Codex [hooks documentation](https://developers.openai.com/codex/hooks)
+when adapting the managed lifecycle configuration.
+
+Codex adds the hook's `additionalContext` as developer context. The format is
+bounded and fails closed in the same way as the Claude integration: a live
+lookup failure injects "capabilities not confirmed" instead of an empty or
+cached grant list. No `AGENTS.md` entry is required for discovery. A global
+`~/.codex/AGENTS.md` can reinforce the handling rules, but it is ordinary
+advisory context and is not the production integrity boundary.
+
 ## MCP refresh tool
 
 Run the guest-local stdio server with the same connection arguments:
@@ -165,6 +208,15 @@ Run the guest-local stdio server with the same connection arguments:
   --client-cert /run/forcefield/client.crt \
   --client-key /run/forcefield/client.key
 ```
+
+The server advertises a short initialization instruction that Codex consumes
+as server-wide guidance. It tells the agent to consult `capabilities`, follow
+cursor pagination, use only advertised Forcefield origins, protect the bearer
+and private key, and treat snapshots as advisory. The server remains useful to
+other MCP clients through the tool's own name, description, schema, and safety
+annotations.
+
+### Claude Code MCP configuration
 
 Merge the `forcefield` entry from
 [`deploy/claude/mcp-server.merge.json.example`](../deploy/claude/mcp-server.merge.json.example)
@@ -193,6 +245,33 @@ boundary: a higher-precedence project configuration can shadow it. The managed
 startup hook still provides the trusted initial snapshot, and Forcefield still
 authorizes every request, but production guests should use administrator-owned
 MCP configuration.
+
+### Codex CLI MCP configuration
+
+Merge
+[`deploy/codex/config.toml.merge.example`](../deploy/codex/config.toml.merge.example)
+into the guest's existing `/etc/codex/config.toml`. Do not replace unrelated
+system configuration. Codex starts `ff mcp` directly from the command and
+argument array, exposes the tool as `mcp__forcefield__capabilities`, and reads
+the MCP initialization instructions automatically. The example restricts the
+server to its one tool and sets `required = true`, so Codex startup fails if the
+local MCP process cannot initialize. The process does not contact Forcefield
+until the tool is called; remove `required = true` only if starting without the
+refresh tool is an intentional availability tradeoff.
+
+System `config.toml` is a centrally installed default, not an unoverrideable
+policy layer: higher-precedence user or trusted-project configuration can
+shadow it. Keep the root-managed startup hook as the trusted automatic
+injection path. MCP output is advisory in every case, and the Forcefield
+gateway remains the authorization boundary. See the current Codex
+[MCP documentation](https://developers.openai.com/codex/mcp) and
+[managed configuration documentation](https://developers.openai.com/codex/enterprise/managed-configuration)
+when adapting fleet policy.
+
+After provisioning, `codex features list` should report `hooks` as enabled and
+stable, and `codex mcp list` should show the `forcefield` server. In a fresh
+Codex CLI session, use `/hooks` to inspect the managed lifecycle entries and
+`/mcp` to confirm the refresh tool is active.
 
 The stdio server is intentionally local and narrow. It receives no bearer in
 its arguments, exposes no proxy or arbitrary HTTP tool, and must never be

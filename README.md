@@ -1,16 +1,16 @@
 # Forcefield
 
-Forcefield (`ff`) is a default-deny HTTP credential capability gateway for
-untrusted agents. An agent receives a short-lived `ff_...` token and calls a
-normal HTTP endpoint. Forcefield binds that token to a workload, evaluates the
-canonical request against an immutable grant, fetches the real credential on
-the host, replaces the broker token with that credential, and calls one pinned
-upstream.
+Forcefield (`ff`) is a default-deny credential capability gateway for
+untrusted agents. An agent receives a short-lived `ff_...` token and calls an
+HTTP API or Git smart-HTTP endpoint. Forcefield binds that token to a workload,
+evaluates the canonical request against an immutable grant, fetches the real
+credential on the host, replaces the broker token with that credential, and
+calls one pinned upstream.
 
-The agent can exercise only the authority in its grant; the upstream API key
-does not enter the VM. Forcefield currently supports APIs whose credentials can
-be injected into one HTTP header. It is not a general forward proxy, TLS MITM,
-or universal replacement for provider-specific authentication.
+The agent can exercise only the authority in its grant; the upstream API key or
+Git password does not enter the VM. Forcefield supports header-authenticated
+APIs and an explicit Git smart-HTTP adapter. It is not a general forward proxy,
+TLS MITM, or universal replacement for provider-specific authentication.
 
 ```text
 agent / VM                  trusted host                    upstream
@@ -89,13 +89,14 @@ for a TLS-only `agent-secret` configuration.
 
 ## How authority is structured
 
-- A **service** defines one pinned upstream, one public route, the inbound token
-  header, forwarded-header allowlist, operator-pinned static protocol headers,
-  transport restrictions, and response guard.
+- A **service** defines an adapter, one pinned upstream, one public route, the
+  inbound token header, forwarded-header allowlist, operator-pinned static
+  protocol headers, transport restrictions, and response guard.
 - A **credential** attaches a host-side secret reference and outbound injection
   header to exactly one service.
-- A **policy** attaches deny-wins HTTP, query, JSON, GraphQL, and/or CEL rules to
-  exactly one service. No matching allow means deny.
+- A **policy** attaches either deny-wins HTTP/query/JSON/GraphQL/CEL rules or
+  Git repository/ref rules to exactly one service. No matching allow means
+  deny.
 - A **grant** is the concrete tuple of service, credential, policy revision,
   security-binding revision, and resource ceilings.
 - A **role** is an operator template used only when minting. Tokens contain
@@ -110,8 +111,8 @@ old tokens fail closed after restart unless the old revision remains available.
 - [Architecture](docs/architecture.md)
 - [Configuration and policy reference](docs/configuration.md)
 - [Operating: start, mint, use, delegate, revoke, and roll out policy](docs/operations.md)
-- [Client recipes: curl, OpenAI, and Anthropic](docs/client-recipes.md)
-- [Automatic agent capability awareness: live manifest, Claude hooks, and MCP](docs/agent-awareness.md)
+- [Client recipes: curl, OpenAI, Anthropic, and Git](docs/client-recipes.md)
+- [Automatic agent capability awareness: live manifest, Claude/Codex hooks, and MCP](docs/agent-awareness.md)
 - [Threat model and residual risks](docs/threat-model.md)
 
 ## Supported now
@@ -119,18 +120,22 @@ old tokens fail closed after restart unless the old revision remains available.
 - Header-authenticated REST and JSON APIs
 - GraphQL operation type/name/root-field constraints
 - Bounded CEL predicates over canonical request data
+- Git smart-HTTP clone/fetch/push with repository and per-ref policy
+- Explicit case-sensitive or ASCII-insensitive Git repository identity
+- A path-scoped Git credential helper that reads a delivered `ff_` token file
 - Path-prefix or host-based reverse-proxy routes
 - Source-IP or verified-client-certificate workload binding
 - `agent-secret` and other no-shell exec credential helpers
 - Development-only environment credential lookup
 - Expiring, revocable, monotonically delegated capability tokens
-- Authenticated live capability discovery, a guest CLI, and Claude hook/MCP
-  integration
+- Authenticated live capability discovery, a guest CLI, and Claude Code/Codex
+  CLI hook and MCP integrations
 
 ## Not supported yet
 
 - AWS SigV4 or any request-signing protocol
-- Git smart HTTP, Git credential-helper, or `gh`-specific integration
+- Git LFS, dumb HTTP, signed pushes, push options, or protocol-v2 push
+- `gh`-specific integration
 - OCI/Docker registry token exchanges and challenge flows
 - Generic CONNECT/forward proxying, arbitrary destinations, WebSockets, or HTTP
   upgrades
@@ -149,6 +154,11 @@ expired, revoked, misbound, and under-scoped tokens all fail with a generic
 response. Policies are order-independent: matcher errors deny, any matching deny
 wins, otherwise any matching allow permits, and no match denies. Secrets are
 looked up only after authorization and a fail-closed audit write.
+
+For Git, repository authorization is over the configured URL identity and each
+wire-visible ref update. Operators must choose repository case semantics that
+match the upstream and must not let aliases or server-side hooks translate an
+allowed URL/ref into effects on differently authorized repositories or refs.
 
 The response guard is defense in depth, not a proof that a hostile upstream can
 never disclose a credential. It catches the exact credential in headers or a

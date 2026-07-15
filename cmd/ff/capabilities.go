@@ -18,7 +18,7 @@ func runCapabilities(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	caCert := flags.String("ca-cert", os.Getenv("FORCEFIELD_CA_CERT"), "additional TLS CA certificate")
 	clientCert := flags.String("client-cert", os.Getenv("FORCEFIELD_CLIENT_CERT"), "mTLS client certificate")
 	clientKey := flags.String("client-key", os.Getenv("FORCEFIELD_CLIENT_KEY"), "mTLS client private key")
-	format := flags.String("format", "text", "output format: text, json, or claude-hook")
+	format := flags.String("format", "text", "output format: text, json, claude-hook, or codex-hook")
 	jsonOutput := flags.Bool("json", false, "emit JSON (alias for --format json)")
 	allowInsecure := flags.Bool("allow-insecure", false, "allow loopback HTTP for development")
 	timeout := flags.Duration("timeout", 5*time.Second, "lookup timeout")
@@ -31,16 +31,26 @@ func runCapabilities(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 		}
 		*format = "json"
 	}
-	if *format != "text" && *format != "json" && *format != "claude-hook" {
-		return errors.New("format must be text, json, or claude-hook")
+	if *format != "text" && *format != "json" && *format != "claude-hook" && *format != "codex-hook" {
+		return errors.New("format must be text, json, claude-hook, or codex-hook")
 	}
 
 	event := ""
-	if *format == "claude-hook" {
-		var err error
-		event, err = capabilities.ReadClaudeHookEvent(stdin)
-		if err != nil {
-			return err
+	var readHook func(io.Reader) (string, error)
+	var writeHook func(io.Writer, string, string) error
+	switch *format {
+	case "claude-hook":
+		readHook = capabilities.ReadClaudeHookEvent
+		writeHook = capabilities.WriteClaudeHook
+	case "codex-hook":
+		readHook = capabilities.ReadCodexHookEvent
+		writeHook = capabilities.WriteCodexHook
+	}
+	if readHook != nil {
+		var hookErr error
+		event, hookErr = readHook(stdin)
+		if hookErr != nil {
+			return hookErr
 		}
 	}
 	manifest, err := capabilities.Fetch(context.Background(), capabilities.ClientOptions{
@@ -49,23 +59,23 @@ func runCapabilities(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 		Timeout: *timeout, UserAgent: "forcefield/" + version,
 	})
 	if err != nil {
-		if *format == "claude-hook" {
+		if writeHook != nil {
 			_, _ = fmt.Fprintln(stderr, "ff: Forcefield capability lookup was not confirmed")
-			return capabilities.WriteClaudeHook(stdout, event, capabilities.UnavailableContext())
+			return writeHook(stdout, event, capabilities.UnavailableContext())
 		}
 		return err
 	}
 	switch *format {
 	case "json":
 		return writeJSONOutput(stdout, manifest)
-	case "claude-hook":
+	case "claude-hook", "codex-hook":
 		contextText, err := capabilities.RenderMarkdown(manifest, capabilities.RenderOptions{
 			TokenFile: *tokenFile, CACertPath: *caCert, ClientCertPath: *clientCert, ClientKeyPath: *clientKey,
 		})
 		if err != nil {
-			return capabilities.WriteClaudeHook(stdout, event, capabilities.UnavailableContext())
+			return writeHook(stdout, event, capabilities.UnavailableContext())
 		}
-		return capabilities.WriteClaudeHook(stdout, event, contextText)
+		return writeHook(stdout, event, contextText)
 	default:
 		contextText, err := capabilities.RenderMarkdown(manifest, capabilities.RenderOptions{
 			TokenFile: *tokenFile, CACertPath: *caCert, ClientCertPath: *clientCert, ClientKeyPath: *clientKey,

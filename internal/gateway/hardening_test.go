@@ -20,7 +20,7 @@ func TestNormalizeRequestRepresentationRejectsAmbiguity(t *testing.T) {
 		"duplicate content type":  {"Content-Type": {"application/json", "text/plain"}},
 		"case split content type": {"Content-Type": {"application/json"}, "content-type": {"text/plain"}},
 		"invalid content type":    {"Content-Type": {"application/json, text/plain"}},
-		"encoded body":            {"Content-Encoding": {"gzip"}},
+		"unknown encoding":        {"Content-Encoding": {"br"}},
 		"duplicate encoding":      {"Content-Encoding": {"identity", "gzip"}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -32,6 +32,9 @@ func TestNormalizeRequestRepresentationRejectsAmbiguity(t *testing.T) {
 	header := http.Header{"content-type": {" application/json; charset=utf-8 "}, "Content-Encoding": {"identity"}}
 	if !normalizeRequestRepresentation(header) || header.Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatalf("valid representation was not normalized: %#v", header)
+	}
+	if !normalizeRequestRepresentation(http.Header{"Content-Encoding": {"gzip"}}) {
+		t.Fatal("Git's canonical gzip request encoding was rejected before adapter routing")
 	}
 }
 
@@ -54,6 +57,11 @@ func TestPrepareRequestBodyEnforcesGlobalAndChunkedLimits(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "http://forcefield.test/", strings.NewReader("1234"))
 	if count, err := prepareRequestBody(request, compiled, tokens.Limits{}, 4); err != nil || count != 4 {
 		t.Fatalf("bounded body = (%d, %v)", count, err)
+	}
+	request = httptest.NewRequest(http.MethodPost, "http://forcefield.test/", strings.NewReader("compressed"))
+	request.Header.Set("Content-Encoding", "gzip")
+	if _, err := prepareRequestBody(request, compiled, tokens.Limits{}, 1024); err == nil {
+		t.Fatal("generic HTTP adapter accepted an encoded request body")
 	}
 }
 

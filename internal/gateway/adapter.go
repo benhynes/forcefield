@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,6 +21,7 @@ type HeaderAdapter struct {
 	clientPrefix   string
 	upstreamHeader string
 	upstreamPrefix string
+	basicUsername  string
 	forwardHeaders map[string]struct{}
 	staticHeaders  http.Header
 }
@@ -29,8 +31,11 @@ type HeaderAdapterConfig struct {
 	ClientPrefix   string
 	UpstreamHeader string
 	UpstreamPrefix string
-	ForwardHeaders []string
-	StaticHeaders  map[string]string
+	// UpstreamBasicUsername encodes the secret as the password in an HTTP
+	// Basic Authorization value. It is mutually exclusive with UpstreamPrefix.
+	UpstreamBasicUsername string
+	ForwardHeaders        []string
+	StaticHeaders         map[string]string
 }
 
 func NewHeaderAdapter(cfg HeaderAdapterConfig) (*HeaderAdapter, error) {
@@ -41,6 +46,9 @@ func NewHeaderAdapter(cfg HeaderAdapterConfig) (*HeaderAdapter, error) {
 	}
 	if containsHeaderControl(cfg.ClientPrefix) || containsHeaderControl(cfg.UpstreamPrefix) {
 		return nil, fmt.Errorf("invalid authentication prefix")
+	}
+	if cfg.UpstreamBasicUsername != "" && (upstream != "Authorization" || cfg.UpstreamPrefix != "" || !validBasicUsername(cfg.UpstreamBasicUsername)) {
+		return nil, fmt.Errorf("invalid upstream Basic authentication")
 	}
 	forward := make(map[string]struct{}, len(cfg.ForwardHeaders))
 	for _, name := range cfg.ForwardHeaders {
@@ -70,7 +78,7 @@ func NewHeaderAdapter(cfg HeaderAdapterConfig) (*HeaderAdapter, error) {
 	}
 	return &HeaderAdapter{
 		clientHeader: client, clientPrefix: cfg.ClientPrefix,
-		upstreamHeader: upstream, upstreamPrefix: cfg.UpstreamPrefix,
+		upstreamHeader: upstream, upstreamPrefix: cfg.UpstreamPrefix, basicUsername: cfg.UpstreamBasicUsername,
 		forwardHeaders: forward,
 		staticHeaders:  static,
 	}, nil
@@ -126,8 +134,51 @@ func (a *HeaderAdapter) RewriteHeaders(in, out http.Header, secret []byte) error
 			out.Add(name, value)
 		}
 	}
-	out.Set(a.upstreamHeader, a.upstreamPrefix+string(secret))
+	value := a.upstreamPrefix + string(secret)
+	if a.basicUsername != "" {
+		payload := append([]byte(a.basicUsername+":"), secret...)
+		value = "Basic " + base64.StdEncoding.EncodeToString(payload)
+		zeroBytes(payload)
+	}
+	out.Set(a.upstreamHeader, value)
 	return nil
+}
+
+// LeakPatterns returns independent copies of every exact credential
+// representation the response guard can recognize. Basic authentication adds
+// the base64 payload because reflecting it would expose the upstream password
+// even though the raw secret bytes are absent.
+func (a *HeaderAdapter) LeakPatterns(secret []byte) ([][]byte, error) {
+	if a == nil || !validHeaderCredential(secret) {
+		return nil, errors.New("missing upstream credential")
+	}
+	patterns := [][]byte{append([]byte(nil), secret...)}
+	if a.basicUsername != "" {
+		payload := append([]byte(a.basicUsername+":"), secret...)
+		encoded := make([]byte, base64.StdEncoding.EncodedLen(len(payload)))
+		base64.StdEncoding.Encode(encoded, payload)
+		zeroBytes(payload)
+		patterns = append(patterns, encoded)
+	}
+	return patterns, nil
+}
+
+func validBasicUsername(value string) bool {
+	if value == "" || len(value) > 256 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < 0x21 || value[index] > 0x7e || value[index] == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func zeroCredentialPatterns(patterns [][]byte) {
+	for _, pattern := range patterns {
+		zeroBytes(pattern)
+	}
 }
 
 func validHeaderCredential(secret []byte) bool {

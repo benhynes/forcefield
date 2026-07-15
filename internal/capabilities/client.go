@@ -223,6 +223,11 @@ func readBearerFile(path string) (string, error) {
 	return string(contents), nil
 }
 
+// ReadBearerFile reads a Forcefield bearer from a private, owner-controlled
+// regular file. It is exported for local client integrations such as the Git
+// credential helper; callers receive only the generic ErrLookup failure.
+func ReadBearerFile(path string) (string, error) { return readBearerFile(path) }
+
 func readBoundedRegularFile(path string, maximum int64, private bool) ([]byte, error) {
 	path, err := expandHome(path)
 	if err != nil {
