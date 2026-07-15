@@ -18,18 +18,25 @@ func TestRunGitCredentialGet(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	input := "protocol=https\nhost=forcefield.test:7902\npath=forgejo-git/org/repo.git\nwwwauth[]=Basic realm=forcefield-git\n\n"
-	var output bytes.Buffer
-	if err := runGitCredential([]string{
-		"--url", "https://forcefield.test:7902/forgejo-git",
-		"--token-file", tokenFile,
-		"get",
-	}, strings.NewReader(input), &output); err != nil {
-		t.Fatal(err)
+	// Git terminates helper input with a blank line or end-of-file; git itself
+	// sends the EOF form.
+	inputs := map[string]string{
+		"blank line": "protocol=https\nhost=forcefield.test:7902\npath=forgejo-git/org/repo.git\nwwwauth[]=Basic realm=forcefield-git\n\n",
+		"eof":        "protocol=https\nhost=forcefield.test:7902\npath=forgejo-git/org/repo.git\nwwwauth[]=Basic realm=forcefield-git\n",
 	}
-	want := "username=forcefield\npassword=" + token + "\n\n"
-	if output.String() != want {
-		t.Fatalf("output = %q, want %q", output.String(), want)
+	for name, input := range inputs {
+		var output bytes.Buffer
+		if err := runGitCredential([]string{
+			"--url", "https://forcefield.test:7902/forgejo-git",
+			"--token-file", tokenFile,
+			"get",
+		}, strings.NewReader(input), &output); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := "username=forcefield\npassword=" + token + "\n\n"
+		if output.String() != want {
+			t.Fatalf("%s: output = %q, want %q", name, output.String(), want)
+		}
 	}
 }
 
@@ -91,7 +98,7 @@ func TestRunGitCredentialRejectsMalformedOrOversizedInput(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
 		"empty":              "",
-		"unterminated":       "protocol=https\nhost=forcefield.test\n",
+		"no trailing newline": "protocol=https\nhost=forcefield.test",
 		"duplicate protocol": "protocol=https\nprotocol=https\nhost=forcefield.test\npath=forgejo-git/repo.git\n\n",
 		"compound url":       "url=https://forcefield.test/forgejo-git/repo.git\n\n",
 		"embedded record":    "protocol=https\n\nhost=forcefield.test\n\n",

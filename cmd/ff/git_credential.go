@@ -139,10 +139,17 @@ func readGitCredentialRequest(reader io.Reader) (gitCredentialRequest, error) {
 		return gitCredentialRequest{}, errGitCredential
 	}
 	defer clear(data)
-	if bytes.IndexByte(data, 0) >= 0 || bytes.IndexByte(data, '\r') >= 0 || !bytes.HasSuffix(data, []byte("\n\n")) {
+	// Git terminates helper input with a blank line or end-of-file
+	// (gitcredentials(7)); git itself closes the pipe after the last
+	// attribute line, so the blank line must be optional.
+	if bytes.IndexByte(data, 0) >= 0 || bytes.IndexByte(data, '\r') >= 0 || data[len(data)-1] != '\n' {
 		return gitCredentialRequest{}, errGitCredential
 	}
-	data = data[:len(data)-2]
+	data = data[:len(data)-1]
+	data = bytes.TrimSuffix(data, []byte{'\n'})
+	if len(data) == 0 {
+		return gitCredentialRequest{}, errGitCredential
+	}
 	if bytes.Contains(data, []byte("\n\n")) {
 		return gitCredentialRequest{}, errGitCredential
 	}
