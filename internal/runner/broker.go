@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/benhynes/forcefield/internal/capabilities"
 	"github.com/benhynes/forcefield/internal/config"
 	"github.com/benhynes/forcefield/internal/headersafety"
 	"github.com/benhynes/forcefield/internal/tokens"
@@ -49,6 +50,76 @@ type brokerRoute struct {
 	host    string
 	header  string
 	auth    string
+}
+
+// NewBrokerFromManifest builds a runner broker from the authenticated live
+// capability projection returned by a remote Forcefield gateway. This keeps
+// the gateway configuration and administrative control socket off the runner
+// host while retaining the bearer in the trusted supervisor.
+func NewBrokerFromManifest(manifest capabilities.Manifest, options BrokerOptions) (*Broker, error) {
+	if err := manifest.Validate(); err != nil {
+		return nil, errors.New("runner broker requires a valid capability manifest")
+	}
+	base, err := validateBrokerOrigin(options.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if len(options.Bearer) != tokens.BearerLength || !tokens.ContainsBearer(options.Bearer) {
+		return nil, errors.New("runner broker requires a valid Forcefield bearer")
+	}
+	routes := make([]brokerRoute, 0, len(manifest.Services))
+	maximum := int64(0)
+	for _, service := range manifest.Services {
+		if options.Hive != nil && service.PathPrefix != "" &&
+			(service.PathPrefix == HiveBrokerPrefix || strings.HasPrefix(service.PathPrefix, HiveBrokerPrefix+"/") || strings.HasPrefix(HiveBrokerPrefix, service.PathPrefix+"/")) {
+			return nil, fmt.Errorf("runner broker service %q overlaps the reserved Hive route", service.Name)
+		}
+		routes = append(routes, brokerRoute{
+			service: service.Name, prefix: service.PathPrefix, host: strings.ToLower(service.Host),
+			header: service.Auth.Header, auth: service.Auth.Prefix + options.Bearer,
+		})
+		if service.ConfiguredLimits.MaxRequestBytes > 1<<30 {
+			return nil, fmt.Errorf("runner broker service %q has an unsafe request limit", service.Name)
+		}
+		if limit := int64(service.ConfiguredLimits.MaxRequestBytes); limit > maximum {
+			maximum = limit
+		}
+	}
+	if len(routes) == 0 {
+		return nil, errors.New("runner broker requires at least one granted service")
+	}
+	if maximum == 0 {
+		maximum = 16 << 20
+	}
+	slices.SortFunc(routes, func(left, right brokerRoute) int {
+		if len(left.prefix) != len(right.prefix) {
+			return len(right.prefix) - len(left.prefix)
+		}
+		return strings.Compare(left.service, right.service)
+	})
+	transport := options.Transport
+	if transport == nil {
+		transport, err = newBrokerTransport(options)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var hive *HiveProxy
+	if options.Hive != nil {
+		hive, err = NewHiveProxy(*options.Hive)
+		if err != nil {
+			if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+				closer.CloseIdleConnections()
+			}
+			return nil, err
+		}
+	}
+	brokerContext, cancel := context.WithCancel(context.Background())
+	return &Broker{
+		base: base, bearer: options.Bearer, transport: transport, routes: routes,
+		maximum: maximum, permits: make(chan struct{}, brokerMaxConcurrentRequests),
+		context: brokerContext, cancel: cancel, hive: hive,
+	}, nil
 }
 
 // Broker is a narrow HTTP relay from one sandbox-owned Unix socket to one

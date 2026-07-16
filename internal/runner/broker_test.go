@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/benhynes/forcefield/internal/capabilities"
 	"github.com/benhynes/forcefield/internal/config"
 	"github.com/benhynes/forcefield/internal/tokens"
 )
@@ -124,6 +125,35 @@ func TestBrokerInjectsCapabilityAndStripsCallerCredentials(t *testing.T) {
 	}
 	if recorder.Header().Get("Set-Cookie") != "" || recorder.Header().Get("X-Internal") != "" {
 		t.Fatalf("unsafe response headers = %#v", recorder.Header())
+	}
+}
+
+func TestBrokerBuildsFromRemoteCapabilityManifest(t *testing.T) {
+	t.Parallel()
+	bearer := brokerBearer()
+	manifest := capabilities.Manifest{
+		Version: capabilities.SchemaVersion, GeneratedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(time.Hour),
+		Services: []capabilities.Service{{
+			Name: "openai", Adapter: config.AdapterHTTP, PathPrefix: "/openai",
+			Auth:             capabilities.Auth{Header: "Authorization", Prefix: "Bearer "},
+			ConfiguredLimits: capabilities.Limits{MaxRequestBytes: 1024},
+		}},
+	}
+	var authorization string
+	broker, err := NewBrokerFromManifest(manifest, BrokerOptions{
+		BaseURL: "https://forcefield.example", Bearer: bearer,
+		Transport: brokerRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			authorization = request.Header.Get("Authorization")
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	broker.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader("{}")))
+	if recorder.Code != http.StatusOK || authorization != "Bearer "+bearer {
+		t.Fatalf("response=%d authorization=%q", recorder.Code, authorization)
 	}
 }
 

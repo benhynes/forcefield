@@ -1,8 +1,7 @@
 # Experimental Linux agent-sandbox profile template. Replace every path,
-# identity, hostname, role, route, resource limit, and Hive address for the
+# identity, hostname, capability file, route, resource limit, and Hive address for the
 # target host. Install it at a clean absolute, symlink-free trusted path such as
 # /etc/forcefield/forcefield-runner.yaml, outside every agent workspace. Apply
-# the same path rules to /etc/forcefield/forcefield.yaml.
 version: 1
 # These four directory classes must be clean, non-system, unique, and
 # non-overlapping. Sibling roots under a common trusted parent are allowed.
@@ -18,13 +17,10 @@ profiles:
   codex-worker:
     backend: bubblewrap
 
-    # This role must exist in forcefield.yaml. Give ordinary workers only the
-    # model, repository, and read APIs they actually require; omit Linear.
-    role: openai-agent
-
-    # Replace with: ff identity --cert /etc/forcefield/pki/codex-worker.crt
-    workload: mtls-spki:0000000000000000000000000000000000000000000000000000000000000000
-    token_ttl: 30m
+    # A trusted operator provisions this 0600 file with a short-lived,
+    # workload-bound token minted by the macOS Forcefield service. The runner
+    # reads it on the Debian host but never mounts it into the sandbox.
+    token_file: /var/lib/forcefield-runner/capabilities/codex-worker.token
     forcefield_url: https://forcefield.internal:7902
     ca_cert: /etc/forcefield/pki/workload-ca.crt
     client_cert: /etc/forcefield/pki/codex-worker.crt
@@ -61,7 +57,7 @@ profiles:
       # variables cannot be inherited.
       inherit: [LANG, LC_ALL, TERM, COLORTERM]
       set:
-        # Use only local path-routed services granted by role: openai-agent.
+        # Use only path-routed services present in the token's live manifest.
         # The marker satisfies SDK validation but has no credential authority.
         OPENAI_BASE_URL: http://127.0.0.1:7902/openai
         OPENAI_API_KEY: forcefield-runner-broker

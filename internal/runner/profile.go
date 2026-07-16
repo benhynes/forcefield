@@ -99,6 +99,7 @@ type Profile struct {
 	Role              string      `json:"role" yaml:"role"`
 	Workload          string      `json:"workload" yaml:"workload"`
 	TokenTTL          Duration    `json:"token_ttl" yaml:"token_ttl"`
+	TokenFile         string      `json:"token_file,omitempty" yaml:"token_file,omitempty"`
 	ForcefieldURL     string      `json:"forcefield_url" yaml:"forcefield_url"`
 	CACert            string      `json:"ca_cert,omitempty" yaml:"ca_cert,omitempty"`
 	ClientCert        string      `json:"client_cert,omitempty" yaml:"client_cert,omitempty"`
@@ -168,6 +169,7 @@ type rawProfile struct {
 	Role              string       `yaml:"role"`
 	Workload          string       `yaml:"workload"`
 	TokenTTL          *Duration    `yaml:"token_ttl"`
+	TokenFile         string       `yaml:"token_file,omitempty"`
 	ForcefieldURL     string       `yaml:"forcefield_url"`
 	CACert            string       `yaml:"ca_cert,omitempty"`
 	ClientCert        string       `yaml:"client_cert,omitempty"`
@@ -397,7 +399,7 @@ func ProfileDigest(profile Profile) (string, error) {
 func compileRawProfile(source rawProfile) (Profile, error) {
 	profile := Profile{
 		Backend: source.Backend, Role: source.Role, Workload: source.Workload,
-		ForcefieldURL: source.ForcefieldURL, CACert: source.CACert,
+		TokenFile: source.TokenFile, ForcefieldURL: source.ForcefieldURL, CACert: source.CACert,
 		ClientCert: source.ClientCert, ClientKey: source.ClientKey,
 		RootFS: source.RootFS, WorkspaceTarget: source.WorkspaceTarget,
 		BrokerSocket: source.BrokerSocket, BrokerListen: source.BrokerListen,
@@ -491,14 +493,23 @@ func validateProfile(profile *Profile) error {
 	if profile.Backend != "bubblewrap" {
 		return errors.New("backend must be bubblewrap")
 	}
-	if !validIdentifier(profile.Role) {
-		return errors.New("role is invalid")
-	}
-	if !validWorkload(profile.Workload) {
-		return errors.New("workload is not canonical")
-	}
-	if profile.TokenTTL.Value() < time.Second || profile.TokenTTL.Value() > maximumTokenTTL {
-		return errors.New("token_ttl must be between 1s and 168h")
+	if profile.TokenFile == "" {
+		if !validIdentifier(profile.Role) {
+			return errors.New("role is invalid")
+		}
+		if !validWorkload(profile.Workload) {
+			return errors.New("workload is not canonical")
+		}
+		if profile.TokenTTL.Value() < time.Second || profile.TokenTTL.Value() > maximumTokenTTL {
+			return errors.New("token_ttl must be between 1s and 168h")
+		}
+	} else {
+		if !cleanAbsolutePath(profile.TokenFile) {
+			return errors.New("token_file must be a clean absolute path")
+		}
+		if profile.Role != "" || profile.Workload != "" {
+			return errors.New("token_file cannot be combined with role or workload")
+		}
 	}
 
 	forcefieldURL, err := canonicalForcefieldURL(profile.ForcefieldURL)
@@ -509,10 +520,10 @@ func validateProfile(profile *Profile) error {
 	if (profile.ClientCert == "") != (profile.ClientKey == "") {
 		return errors.New("client_cert and client_key must be configured together")
 	}
-	if profile.ClientCert == "" && strings.HasPrefix(profile.Workload, "mtls-spki:") {
+	if profile.TokenFile == "" && profile.ClientCert == "" && strings.HasPrefix(profile.Workload, "mtls-spki:") {
 		return errors.New("mTLS workload requires client_cert and client_key")
 	}
-	if profile.ClientCert != "" && !strings.HasPrefix(profile.Workload, "mtls-spki:") {
+	if profile.TokenFile == "" && profile.ClientCert != "" && !strings.HasPrefix(profile.Workload, "mtls-spki:") {
 		return errors.New("client_cert and client_key require an mTLS workload")
 	}
 	for _, path := range []string{profile.CACert, profile.ClientCert, profile.ClientKey} {

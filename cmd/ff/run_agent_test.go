@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/benhynes/forcefield/internal/capabilities"
 	"github.com/benhynes/forcefield/internal/config"
 	"github.com/benhynes/forcefield/internal/runner"
 	"github.com/benhynes/forcefield/internal/tokens"
@@ -72,6 +73,14 @@ func TestGrantedServiceNamesAreUniqueAndSorted(t *testing.T) {
 	t.Parallel()
 	grants := []tokens.Grant{{Service: "linear"}, {Service: "github"}, {Service: "linear"}}
 	if got, want := grantedServiceNames(grants), []string{"github", "linear"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("services = %#v, want %#v", got, want)
+	}
+}
+
+func TestManifestServiceNamesAreSorted(t *testing.T) {
+	t.Parallel()
+	manifest := capabilities.Manifest{Services: []capabilities.Service{{Name: "openai"}, {Name: "github"}}}
+	if got, want := manifestServiceNames(manifest), []string{"github", "openai"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("services = %#v, want %#v", got, want)
 	}
 }

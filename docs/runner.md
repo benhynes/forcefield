@@ -3,8 +3,11 @@
 `ff run` is an experimental Linux wrapper for running multiple untrusted agents
 on one VM without placing Forcefield or Hive credentials in their processes. It
 combines an operator-owned profile, a host-side capability broker, a transient
-systemd user service, and a bubblewrap sandbox. This is useful process isolation
-and authority separation; it is not yet a VM-grade or multi-tenant boundary.
+systemd user service, and a bubblewrap sandbox. The Forcefield credential
+gateway may remain on a separate trusted macOS host: the Linux runner consumes
+a protected, workload-bound capability file and fetches its live service
+manifest from that gateway. This is useful process isolation and authority
+separation; it is not yet a VM-grade or multi-tenant boundary.
 
 Use it to give each agent a different Forcefield role and Hive messaging ACL.
 Keep deterministic external-system writers, such as a Linear bridge, outside
@@ -23,8 +26,8 @@ The trusted computing base includes:
 
 - the host kernel, systemd user manager, bubblewrap, host `ff` binary, and
   Forcefield service;
-- the host operator and processes outside the sandbox that can act as the
-  Forcefield host UID;
+- the runner-host operator and processes outside the sandbox that can read its
+  capability and TLS files;
 - the runner profile, prepared root filesystem, host TLS material, and any
   explicitly mounted host files;
 - the configured Forcefield and optional Hive origins.
@@ -37,16 +40,16 @@ bearer. The mounted Unix socket is its capability to reach a narrow broker.
 ```text
 trusted host
 ----------------------------------------------------------------------------
-Hive manager environment                 Forcefield same-user control socket
+Hive manager environment                 protected capability file
 personal MSG token, never CONTROL                    |
-             |                                        | mint/revoke
+             |                                        | short-lived ff_ token
              v                                        v
         ff run supervisor ----------------> host-side runner broker
-        profile + state                    Forcefield route/token injection
+        profile + state                    manifest-derived route/token injection
         systemd lifecycle                  optional Hive message ACL/token
              |                                        |
              | systemd --user service                 | pinned origins
-             v                                        +--> Forcefield --> APIs
+             v                                        +--> macOS Forcefield --> APIs
         bubblewrap + cgroup + seccomp                  +--> Hive
         read-only rootfs
         private namespaces
@@ -75,9 +78,13 @@ The host must provide all of the following:
    filter synchronization. The runner does not fall back to a weaker backend.
    Host launch helpers are resolved only from trusted `/usr/bin` or `/bin`
    locations, not an agent-controlled `PATH`.
-4. A running Forcefield instance and its normal `forcefield.yaml`. `ff run`
-   must run as the same host UID as `ff serve`, because mint and revoke use the
-   same-UID private admin socket.
+4. A reachable Forcefield gateway. For the recommended split-host deployment,
+   provision a private `0600` token file on the runner host. Mint it on the
+   trusted Forcefield host for the runner's IP or mTLS workload and keep its TTL
+   no longer than the intended sandbox lifetime. The runner authenticates the
+   live capability manifest before launch and retains the bearer outside the
+   sandbox. Same-host deployments may omit `token_file` and continue to use
+   `role`, `workload`, and `token_ttl` with the private admin socket.
 5. A prepared, non-root root filesystem. It must be an absolute directory that
    is not group- or world-writable and must contain the agent runtime plus the
    operator-trusted sandbox init at the fixed path `/usr/local/bin/ff`. The
@@ -145,9 +152,8 @@ The important per-profile fields are:
 
 | Field | Purpose |
 |---|---|
-| `role` | Existing Forcefield role used to mint one non-delegable bearer. |
-| `workload` | Canonical `ip:` or `mtls-spki:` identity for the broker's connection to Forcefield. |
-| `token_ttl` | Lifetime of the one bearer minted at launch; it is not refreshed. |
+| `token_file` | Recommended split-host mode: protected short-lived bearer minted by the trusted Forcefield host and never mounted into the sandbox. |
+| `role`, `workload`, `token_ttl` | Alternative same-host mode: mint through the local Forcefield admin socket. Mutually exclusive with `token_file`. |
 | `forcefield_url` | Exact Forcefield origin. It must match `server.advertised_base_url`, or the derived local listener when no advertised URL is set. |
 | `ca_cert`, `client_cert`, `client_key` | Host paths used only by the broker. Client material is required for an mTLS workload and forbidden for an IP workload. |
 | `rootfs` | Host root filesystem mounted read-only as `/`; it must be strictly below `rootfs_directory`. |
@@ -212,7 +218,6 @@ prepared rootfs. It is deliberately not configurable on the command line.
 
 ```sh
 ff run \
-  --config /etc/forcefield/forcefield.yaml \
   --profiles /etc/forcefield/forcefield-runner.yaml \
   --profile codex-worker \
   --agent codex-2 \
@@ -226,8 +231,8 @@ name such as `codex-2`, not the full Hive address. For a profile without a
 valid only because it is a strict descendant of the example's
 `workspace_directory`.
 
-For Hive, configure the agent manager to execute this exact wrapper as the
-agent's host-side command. The outer process must receive the personal
+For Hive, select this runner in the trusted spawn profile rather than making
+the worker construct the wrapper command. The outer process must receive the personal
 `HIVE_TOKEN`, canonical `HIVE_AGENT=name@host`, `HIVE_NET`, and `HIVE_ADDR`
 created by Hive. `--agent` must match the name portion. Keep the command and
 profile choice in trusted Hive/operator configuration rather than in a prompt

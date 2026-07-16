@@ -23,6 +23,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/benhynes/forcefield/internal/capabilities"
 	"github.com/benhynes/forcefield/internal/config"
 	"github.com/benhynes/forcefield/internal/control"
 	"github.com/benhynes/forcefield/internal/runner"
@@ -73,24 +74,29 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := runner.VerifyWorkloadIdentity(profile); err != nil {
-		return err
-	}
-	if err := runner.ValidateOperatorFile(options.configPath, workspace); err != nil {
-		return err
-	}
-	compiled, err := config.Load(options.configPath)
-	if err != nil {
-		return err
-	}
-	if _, exists := compiled.Roles[profile.Role]; !exists {
-		return fmt.Errorf("runner profile references unknown Forcefield role %q", profile.Role)
-	}
-	if profile.TokenTTL.Value() > compiled.File.Server.MaxTokenTTL.Value() {
-		return errors.New("runner token_ttl exceeds the Forcefield server maximum")
-	}
-	if err := bindRunnerOrigin(profile.ForcefieldURL, compiled.File.Server); err != nil {
-		return err
+	var compiled *config.Compiled
+	if profile.TokenFile == "" {
+		if err := runner.VerifyWorkloadIdentity(profile); err != nil {
+			return err
+		}
+		if err := runner.ValidateOperatorFile(options.configPath, workspace); err != nil {
+			return err
+		}
+		compiled, err = config.Load(options.configPath)
+		if err != nil {
+			return err
+		}
+		if _, exists := compiled.Roles[profile.Role]; !exists {
+			return fmt.Errorf("runner profile references unknown Forcefield role %q", profile.Role)
+		}
+		if profile.TokenTTL.Value() > compiled.File.Server.MaxTokenTTL.Value() {
+			return errors.New("runner token_ttl exceeds the Forcefield server maximum")
+		}
+		if err := bindRunnerOrigin(profile.ForcefieldURL, compiled.File.Server); err != nil {
+			return err
+		}
+	} else if err := runner.ValidateOperatorFile(profile.TokenFile, workspace); err != nil {
+		return fmt.Errorf("validate runner token file: %w", err)
 	}
 	hiveOptions, hiveAgent, err := runnerHiveOptions(profile, options.agent)
 	if err != nil {
@@ -102,21 +108,25 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err := runner.PrepareStateDirectory(runnerConfig.StateDirectory); err != nil {
 		return err
 	}
-	sensitivePaths := []string{
-		compiled.File.Server.AdminSocket,
-		compiled.File.Server.TLSKey,
-		compiled.File.State.TokenFile,
-		compiled.File.State.AuditFile,
-		profile.ClientKey,
-	}
-	if compiled.File.Secrets.Type == "exec" {
-		sensitivePaths = append(sensitivePaths, compiled.File.Secrets.Command)
+	sensitivePaths := []string{profile.ClientKey, profile.TokenFile}
+	operatorFiles := []string{options.profilesPath}
+	if compiled != nil {
+		operatorFiles = append(operatorFiles, options.configPath)
+		sensitivePaths = append(sensitivePaths,
+			compiled.File.Server.AdminSocket,
+			compiled.File.Server.TLSKey,
+			compiled.File.State.TokenFile,
+			compiled.File.State.AuditFile,
+		)
+		if compiled.File.Secrets.Type == "exec" {
+			sensitivePaths = append(sensitivePaths, compiled.File.Secrets.Command)
+		}
 	}
 	if err := runner.ValidateHostIsolation(runner.HostIsolationSpec{
 		Profile: profile, Workspace: workspace, StateDirectory: runnerConfig.StateDirectory,
 		RootFSDirectory: runnerConfig.RootFSDirectory, WorkspaceDirectory: runnerConfig.WorkspaceDirectory,
 		ReadOnlySourceDirectories: runnerConfig.ReadOnlySourceDirectories,
-		OperatorFiles:             []string{options.profilesPath, options.configPath}, SensitivePaths: sensitivePaths,
+		OperatorFiles:             operatorFiles, SensitivePaths: sensitivePaths,
 	}); err != nil {
 		return err
 	}
@@ -139,22 +149,44 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return errors.New("runner broker socket path is already occupied")
 	}
 
-	client, err := control.NewClient(compiled.File.Server.AdminSocket)
-	if err != nil {
-		return err
-	}
-	mintContext, cancelMint := context.WithTimeout(context.Background(), runnerCleanupTimeout)
-	issued, err := client.Mint(mintContext, control.MintRequest{
-		Role: profile.Role, Workload: profile.Workload,
-		TTLSeconds: int64(profile.TokenTTL.Value() / time.Second), AllowDelegation: false,
-	})
-	cancelMint()
-	if err != nil {
-		return err
+	var (
+		client   *control.Client
+		issued   tokens.IssuedToken
+		manifest capabilities.Manifest
+	)
+	if compiled != nil {
+		client, err = control.NewClient(compiled.File.Server.AdminSocket)
+		if err != nil {
+			return err
+		}
+		mintContext, cancelMint := context.WithTimeout(context.Background(), runnerCleanupTimeout)
+		issued, err = client.Mint(mintContext, control.MintRequest{
+			Role: profile.Role, Workload: profile.Workload,
+			TTLSeconds: int64(profile.TokenTTL.Value() / time.Second), AllowDelegation: false,
+		})
+		cancelMint()
+		if err != nil {
+			return err
+		}
+	} else {
+		fetchContext, cancelFetch := context.WithTimeout(context.Background(), runnerCleanupTimeout)
+		manifest, err = capabilities.Fetch(fetchContext, capabilities.ClientOptions{
+			BaseURL: profile.ForcefieldURL, TokenFile: profile.TokenFile,
+			CACertPath: profile.CACert, ClientCert: profile.ClientCert, ClientKey: profile.ClientKey,
+			UserAgent: "forcefield-runner",
+		})
+		cancelFetch()
+		if err != nil {
+			return fmt.Errorf("fetch remote runner capabilities: %w", err)
+		}
+		issued.Bearer, err = capabilities.ReadBearerFile(profile.TokenFile)
+		if err != nil {
+			return errors.New("read remote runner capability")
+		}
 	}
 	revoked := false
 	revoke := func() error {
-		if revoked {
+		if revoked || client == nil {
 			return nil
 		}
 		revokeContext, cancel := context.WithTimeout(context.Background(), runnerCleanupTimeout)
@@ -168,9 +200,15 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	defer func() { _ = revoke() }()
 
 	services := grantedServiceNames(issued.Claims.Grants)
+	tokenID, workload := issued.Claims.TokenID, profile.Workload
+	if compiled == nil {
+		services = manifestServiceNames(manifest)
+		tokenID = ""
+		workload = "remote-capability"
+	}
 	record := runner.RunRecord{
 		Version: 1, SandboxID: sandboxID, Agent: options.agent, Profile: options.profile,
-		ProfileDigest: profileDigest, TokenID: issued.Claims.TokenID, Workload: profile.Workload,
+		ProfileDigest: profileDigest, TokenID: tokenID, Workload: workload,
 		Workspace: workspace, Services: services, HiveAgent: hiveAgent, Unit: unit,
 		Status: runner.RunStarting, StartedAt: time.Now().Round(0).UTC(),
 	}
@@ -186,11 +224,17 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return errors.Join(err, revoke())
 	}
 
-	broker, err := runner.NewBroker(compiled, runner.BrokerOptions{
+	brokerOptions := runner.BrokerOptions{
 		BaseURL: profile.ForcefieldURL, Bearer: issued.Bearer, AllowedServices: services,
 		CACertPath: profile.CACert, ClientCertPath: profile.ClientCert, ClientKeyPath: profile.ClientKey,
 		Hive: hiveOptions,
-	})
+	}
+	var broker *runner.Broker
+	if compiled != nil {
+		broker, err = runner.NewBroker(compiled, brokerOptions)
+	} else {
+		broker, err = runner.NewBrokerFromManifest(manifest, brokerOptions)
+	}
 	if hiveOptions != nil {
 		hiveOptions.Token = ""
 	}
@@ -303,7 +347,7 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 
 func parseAgentRunOptions(args []string, output io.Writer) (agentRunOptions, bool, error) {
 	flags := newFlagSet("run")
-	configPath := flags.String("config", "/etc/forcefield/forcefield.yaml", "absolute Forcefield configuration file outside the workspace")
+	configPath := flags.String("config", "/etc/forcefield/forcefield.yaml", "same-host mode: absolute Forcefield configuration file outside the workspace")
 	profilesPath := flags.String("profiles", "/etc/forcefield/forcefield-runner.yaml", "absolute runner profiles file outside the workspace")
 	profile := flags.String("profile", "", "operator-owned sandbox profile")
 	agent := flags.String("agent", "", "Hive agent identity for audit correlation")
@@ -428,6 +472,15 @@ func grantedServiceNames(grants []tokens.Grant) []string {
 		}
 		seen[grant.Service] = struct{}{}
 		services = append(services, grant.Service)
+	}
+	slices.Sort(services)
+	return services
+}
+
+func manifestServiceNames(manifest capabilities.Manifest) []string {
+	services := make([]string, 0, len(manifest.Services))
+	for _, service := range manifest.Services {
+		services = append(services, service.Name)
 	}
 	slices.Sort(services)
 	return services
