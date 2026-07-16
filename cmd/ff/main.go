@@ -89,6 +89,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runGitCredential(args[1:], stdin, stdout)
 	case "ssh":
 		return runSSH(args[1:], stdin, stdout, stderr)
+	case "run":
+		return runAgent(args[1:], stdin, stdout, stderr)
+	case "runner":
+		return runRunner(args[1:], stdout, stderr)
+	case "_sandbox-init":
+		return runSandboxInit(args[1:], stdin, stdout, stderr)
 	case "version", "--version", "-version":
 		_, err := fmt.Fprintln(stdout, version)
 		return err
@@ -480,9 +486,11 @@ Usage:
   ff revoke   --config forcefield.yaml --token-id TOKEN_ID
   ff identity --ip VM_IP | --cert CLIENT_CERT
   ff capabilities --url FORCEFIELD_ORIGIN [--format text|json|claude-hook|codex-hook]
-  ff mcp --url FORCEFIELD_ORIGIN [--token-file PATH]
-  ff git-credential --url FORCEFIELD_GIT_URL --token-file PATH get|store|erase
-  ff ssh [options] SERVICE [-- COMMAND ...]
-  ff version
+	ff mcp --url FORCEFIELD_ORIGIN [--token-file PATH]
+	ff git-credential --url FORCEFIELD_GIT_URL --token-file PATH get|store|erase
+	ff ssh [options] SERVICE [-- COMMAND ...]
+	ff run --config forcefield.yaml --profiles forcefield-runner.yaml --profile PROFILE --agent AGENT -- /absolute/agent-command
+	ff runner doctor --profiles forcefield-runner.yaml --profile PROFILE --workspace DIR
+	ff version
 `)
 }

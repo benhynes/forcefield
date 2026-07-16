@@ -1,0 +1,92 @@
+# Experimental Linux agent-sandbox profile template. Replace every path,
+# identity, hostname, capability file, route, resource limit, and Hive address for the
+# target host. Install it at a clean absolute, symlink-free trusted path such as
+# /etc/forcefield/forcefield-runner.yaml, outside every agent workspace. Apply
+version: 1
+# These four directory classes must be clean, non-system, unique, and
+# non-overlapping. Sibling roots under a common trusted parent are allowed.
+# Provision them with symlink-free root/runner-owned ancestry and without
+# group/world write access before launching a sandbox.
+state_directory: /var/lib/forcefield-runner/state
+rootfs_directory: /var/lib/forcefield-runner/rootfs
+workspace_directory: /srv/agent-worktrees
+read_only_source_directories:
+  - /var/lib/forcefield-runner/mounts
+
+profiles:
+  codex-worker:
+    backend: bubblewrap
+
+    # A trusted operator provisions this 0600 file with a short-lived,
+    # workload-bound token minted by the macOS Forcefield service. The runner
+    # reads it on the Debian host but never mounts it into the sandbox.
+    token_file: /var/lib/forcefield-runner/capabilities/codex-worker.token
+    forcefield_url: https://forcefield.internal:7902
+    ca_cert: /etc/forcefield/pki/workload-ca.crt
+    client_cert: /etc/forcefield/pki/codex-worker.crt
+    client_key: /etc/forcefield/pki/codex-worker.key
+
+    # Prepared by the operator, mounted read-only, and strictly below the global
+    # rootfs_directory.
+    # It must contain the trusted sandbox init at the fixed, non-overridable
+    # path /usr/local/bin/ff and the selected agent runtime.
+    rootfs: /var/lib/forcefield-runner/rootfs/debian-agent
+    workspace_target: /workspace
+    # Read-only is the default. Set false only in a separate execution profile
+    # that is always launched with a dedicated, disposable worktree on a
+    # filesystem/project-quota-bounded volume; MemoryMax does not cap disk.
+    workspace_read_only: true
+
+    # These defaults are written explicitly so the SDK base URLs below are
+    # visibly tied to the sandbox-only loopback relay.
+    broker_socket: /run/forcefield/broker.sock
+    broker_listen: 127.0.0.1:7902
+
+    # Every source must be at or below an approved read_only_source_directories
+    # root, such as /var/lib/forcefield-runner/mounts. Add only immutable tools
+    # or sanitized trust data that the rootfs cannot contain. Targets under /run
+    # are forbidden. Under /home, only an individual regular file beneath
+    # /home/agent may be mounted. Never expose host credential homes, provider
+    # login state, sockets, the runner state/config files, Forcefield stores,
+    # private keys, or another workspace. Protected host-path exposure and
+    # overlapping targets fail before minting.
+    read_only_mounts: []
+
+    environment:
+      # Missing names are ignored. Secret-shaped names and tmux/systemd manager
+      # variables cannot be inherited.
+      inherit: [LANG, LC_ALL, TERM, COLORTERM]
+      set:
+        # Use only path-routed services present in the token's live manifest.
+        # The marker satisfies SDK validation but has no credential authority.
+        OPENAI_BASE_URL: http://127.0.0.1:7902/openai
+        OPENAI_API_KEY: forcefield-runner-broker
+
+        # Clone this profile with role: anthropic-agent for a Claude worker,
+        # and use these values instead:
+        # ANTHROPIC_BASE_URL: http://127.0.0.1:7902/anthropic
+        # ANTHROPIC_API_KEY: forcefield-runner-broker
+
+    # Optional. Remove this entire mapping for a worker with no Hive access.
+    # The host-side supervisor accepts one personal MSG token for the matching
+    # HIVE_AGENT and refuses a non-empty HIVE_CONTROL_TOKEN.
+    hive:
+      url: https://hive.internal:7777
+      network: engineering
+      allow_to:
+        # A bare name is pinned to the local host from HIVE_AGENT. The proxy
+        # synthesizes only that self host for Hive MCP recipient expansion.
+        - linear-lead
+        - codex-reviewer@debian-dev
+      allow_kinds: [msg, ask, answer]
+      allow_broadcast: false
+      allow_discovery: false
+
+    resources:
+      # The host supervisor separately caps its soft RLIMIT_NOFILE at 256; the
+      # sandbox service has fixed LimitNOFILE=1024 and MemorySwapMax=0.
+      memory_max_bytes: 8589934592
+      tasks_max: 512
+      cpu_quota_percent: 400
+      # Enforced both by the supervisor timer and systemd RuntimeMaxSec.
+      wall_time: 30m
