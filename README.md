@@ -32,6 +32,12 @@ but it has not had an independent security audit. Start with mock upstreams and
 provider credentials that are already narrowly scoped. Read the
 [threat model](docs/threat-model.md) before putting a live credential behind it.
 
+The repository also contains an experimental Linux `ff run` agent sandbox
+wrapper. It keeps Forcefield and optional Hive credentials in a host-side
+broker while applying bubblewrap, systemd resource limits, and seccomp around
+one agent. It is not yet a VM-grade or multi-tenant boundary; read the
+[agent sandbox runner guide](docs/runner.md) before trying it.
+
 ## Quickstart with the local mock
 
 Requirements: Go 1.26 or newer, Python 3, and curl.
@@ -113,6 +119,7 @@ old tokens fail closed after restart unless the old revision remains available.
 - [Operating: start, mint, use, delegate, revoke, and roll out policy](docs/operations.md)
 - [Client recipes: curl, OpenAI, Anthropic, and Git](docs/client-recipes.md)
 - [Automatic agent capability awareness: live manifest, Claude/Codex hooks, and MCP](docs/agent-awareness.md)
+- [Experimental Linux agent sandbox runner](docs/runner.md)
 - [Threat model and residual risks](docs/threat-model.md)
 
 ## Supported now
@@ -130,6 +137,12 @@ old tokens fail closed after restart unless the old revision remains available.
 - Expiring, revocable, monotonically delegated capability tokens
 - Authenticated live capability discovery, a guest CLI, and Claude Code/Codex
   CLI hook and MCP integrations
+- Experimental Linux amd64/arm64 `ff run` wrapping with an operator-owned
+  profile, read-only rootfs, read-only-by-default per-agent workspace,
+  disjoint operator-approved host directory roots, hard systemd runtime and
+  resource ceilings, bubblewrap namespaces, seccomp, a bounded streaming
+  credential-hiding Forcefield broker, and an optional recipient/kind-limited
+  Hive MSG proxy
 
 ## Not supported yet
 
@@ -144,8 +157,21 @@ old tokens fail closed after restart unless the old revision remains available.
   short-lived SSH certificates or a constrained `ProxyCommand`)
 - Runtime config reload, runtime shadow-policy evaluation, or an observe mode
 - Request-body rewriting or provider-semantic approval workflows
+- Non-Linux agent sandboxing, VM-grade hostile-tenant isolation, unique
+  per-sandbox host UIDs/peer credentials, rootfs provisioning, or automatic
+  runner crash reconciliation
+- Rootfs, tool, mount, or operator-config content attestation; the runner
+  profile digest records configuration fields, not file contents
+- Runner-managed writable-workspace disk quotas; swap is disabled, but
+  execution profiles still need host filesystem/project quotas or disposable
+  bounded volumes
+- Debian/tmux end-to-end validation of the mediated controlling PTY, job
+  control, and real Claude/Codex interactive CLIs remains outstanding
+- Atomic task claims, fencing generations, Linear board integration, or an
+  agent review/workflow engine; these belong in a deterministic coordinator
 
-These require explicit adapters; see the [adapter roadmap](docs/architecture.md#adapter-boundary-and-roadmap).
+Provider and protocol additions require explicit adapters; see the
+[adapter roadmap](docs/architecture.md#adapter-boundary-and-roadmap).
 
 ## Security invariants
 

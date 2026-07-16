@@ -35,7 +35,12 @@ var version = "dev"
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "ff: %v\n", err)
-		os.Exit(1)
+		code := 1
+		var exitError interface{ ExitCode() int }
+		if errors.As(err, &exitError) && exitError.ExitCode() > 0 && exitError.ExitCode() <= 255 {
+			code = exitError.ExitCode()
+		}
+		os.Exit(code)
 	}
 }
 
@@ -63,6 +68,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runMCP(args[1:], stdin, stdout)
 	case "git-credential":
 		return runGitCredential(args[1:], stdin, stdout)
+	case "run":
+		return runAgent(args[1:], stdin, stdout, stderr)
+	case "_sandbox-init":
+		return runSandboxInit(args[1:], stdin, stdout, stderr)
 	case "version", "--version", "-version":
 		_, err := fmt.Fprintln(stdout, version)
 		return err
@@ -456,6 +465,7 @@ Usage:
   ff capabilities --url FORCEFIELD_ORIGIN [--format text|json|claude-hook|codex-hook]
   ff mcp --url FORCEFIELD_ORIGIN [--token-file PATH]
   ff git-credential --url FORCEFIELD_GIT_URL --token-file PATH get|store|erase
+  ff run --config forcefield.yaml --profiles forcefield-runner.yaml --profile PROFILE --agent AGENT -- /absolute/agent-command
   ff version
 `)
 }
