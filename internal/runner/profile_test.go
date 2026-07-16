@@ -42,6 +42,7 @@ profiles:
     rootfs: /var/lib/forcefield-runner-rootfs/debian
     workspace_target: /workspace
     workspace_read_only: true
+    share_network: true
     broker_socket: /run/forcefield/worker.sock
     broker_listen: "[::1]:7902"
     read_only_mounts:
@@ -106,7 +107,7 @@ func TestDecodeAcceptsAndCanonicalizesCompleteProfile(t *testing.T) {
 	if profile.ForcefieldURL != "http://127.0.0.1:7902" {
 		t.Fatalf("forcefield URL = %q", profile.ForcefieldURL)
 	}
-	if profile.BrokerListen != "[::1]:7902" || !profile.WorkspaceReadOnly {
+	if profile.BrokerListen != "[::1]:7902" || !profile.WorkspaceReadOnly || !profile.ShareNetwork {
 		t.Fatalf("sandbox fields = %#v", profile)
 	}
 	if profile.TokenTTL.Value() != 30*time.Minute || profile.Resources.WallTime.Value() != 90*time.Minute {
@@ -301,6 +302,17 @@ func TestDecodeRejectsUnsafeSandboxPathsAndListen(t *testing.T) {
 		"missing listen port":    addProfileField(validRunnerConfig, "broker_listen: 127.0.0.1"),
 	}
 	assertInvalidConfigs(t, tests)
+}
+
+func TestDecodeAcceptsDynamicLoopbackBrokerPort(t *testing.T) {
+	t.Parallel()
+	config, err := Decode(strings.NewReader(addProfileField(validRunnerConfig, "broker_listen: 127.0.0.1:0")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.Profiles["execution_worker"].BrokerListen; got != "127.0.0.1:0" {
+		t.Fatalf("broker listen = %q", got)
+	}
 }
 
 func TestDecodeRejectsUnsafeMounts(t *testing.T) {

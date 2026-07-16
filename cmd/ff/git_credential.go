@@ -139,11 +139,12 @@ func readGitCredentialRequest(reader io.Reader) (gitCredentialRequest, error) {
 		return gitCredentialRequest{}, errGitCredential
 	}
 	defer clear(data)
-	if bytes.IndexByte(data, 0) >= 0 || bytes.IndexByte(data, '\r') >= 0 || !bytes.HasSuffix(data, []byte("\n\n")) {
+	if bytes.IndexByte(data, 0) >= 0 || bytes.IndexByte(data, '\r') >= 0 || !bytes.HasSuffix(data, []byte("\n")) {
 		return gitCredentialRequest{}, errGitCredential
 	}
-	data = data[:len(data)-2]
-	if bytes.Contains(data, []byte("\n\n")) {
+	data = bytes.TrimSuffix(data, []byte("\n"))
+	data = bytes.TrimSuffix(data, []byte("\n"))
+	if len(data) == 0 || bytes.Contains(data, []byte("\n\n")) {
 		return gitCredentialRequest{}, errGitCredential
 	}
 

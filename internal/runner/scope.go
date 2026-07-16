@@ -54,7 +54,6 @@ func BuildSystemdScope(unit string, resources Resources, command CommandSpec, en
 		"--property=LimitNOFILE=1024",
 		"--property=KillMode=control-group",
 		"--property=NoNewPrivileges=yes",
-		"--property=PrivateDevices=yes",
 	}
 	if terminal {
 		// A Hive spawn is attached to a tmux PTY. systemd cannot directly inherit

@@ -161,7 +161,7 @@ The important per-profile fields are:
 | `workspace_read_only` | Mount the workspace read-only; defaults to `true`. Set `false` only for a dedicated disposable worktree. |
 | `read_only_mounts` | Additional explicit host file or directory exposures. Each source must be at or below an approved `read_only_source_directories` root; protected host-path exposure and target overlaps are rejected. |
 | `broker_socket` | Fixed socket location inside the sandbox; defaults to `/run/forcefield/broker.sock`. |
-| `broker_listen` | Sandbox-only loopback listener; defaults to `127.0.0.1:7902`. |
+| `broker_listen` | Sandbox-only loopback listener; defaults to `127.0.0.1:7902`. Use port `0` to allocate a collision-free port per run, especially with `share_network: true`. |
 | `environment` | Secret-free inherited names and operator-set values after a complete environment clear. |
 | `hive` | Optional pinned Hive origin, network, recipient, message-kind, broadcast, and discovery policy. |
 | `resources` | systemd memory, process-count, CPU, and hard runtime ceilings. |
@@ -278,14 +278,15 @@ deterministic bridge must validate them before changing an external board.
 The transient systemd user service applies `MemoryMax`, `MemorySwapMax=0`,
 `TasksMax`, `CPUQuota`, `RuntimeMaxSec`, a five-second stop timeout with final
 `SIGKILL`, `LimitNOFILE=1024`, `KillMode=control-group`,
-`NoNewPrivileges`, and private-device policy before starting bubblewrap. The
+`NoNewPrivileges` before starting bubblewrap. Bubblewrap supplies the sandbox's
+private minimal `/dev` mount. The
 host supervisor lowers its own soft `RLIMIT_NOFILE` to at most 256 before
 opening the per-run broker. `RuntimeMaxSec` is derived from
 `resources.wall_time`, so the user manager retains a hard deadline even if the
 `ff run` supervisor is killed.
 
-Bubblewrap clears the environment, drops capabilities, unshares all supported
-namespaces, gives the process private `/proc`, `/dev`, `/tmp`, `/run`, and
+Bubblewrap clears the environment, drops capabilities, and by default unshares
+all supported namespaces, giving the process private `/proc`, `/dev`, `/tmp`, `/run`, and
 `/home`, mounts the prepared root read-only, and exposes only the selected
 workspace, validated read-only mounts, and broker socket. General network
 access is absent; a credentialless loopback relay can reach only the mounted
@@ -296,6 +297,12 @@ the filter rejects the `TIOCSTI` terminal-input injection request and permits
 fail with `EPERM`. The private network namespace still prevents those Internet
 families from reaching an external network—the loopback relay is the only
 broker path.
+
+An operator may set `share_network: true` on a trusted profile that must
+authenticate directly to external services. This deliberately retains the host
+network namespace while preserving the filesystem, cgroup, seccomp, and
+Forcefield/Hive credential-broker boundaries. Do not enable it for hostile or
+unknown workloads.
 
 When launched from a terminal, `systemd-run --pty` provides a subordinate,
 mediated controlling PTY and bubblewrap preserves it for agent TUIs and shell

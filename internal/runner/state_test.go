@@ -59,13 +59,53 @@ func TestWriteRunRecordRejectsUnsafeState(t *testing.T) {
 	}
 }
 
+func TestWriteRunRecordAcceptsRemoteCapabilityWithoutLocalTokenID(t *testing.T) {
+	t.Parallel()
+	record := validRunRecord()
+	record.TokenID = ""
+	record.Workload = "remote-capability"
+	if err := WriteRunRecord(filepath.Join(t.TempDir(), "state"), record); err != nil {
+		t.Fatal(err)
+	}
+	record.TokenID = strings.Repeat("c", 64)
+	if err := WriteRunRecord(filepath.Join(t.TempDir(), "state"), record); err == nil {
+		t.Fatal("remote capability accepted a local token identifier")
+	}
+}
+
 func validRunRecord() RunRecord {
 	return RunRecord{
 		Version: runRecordVersion, SandboxID: strings.Repeat("a", 32), Agent: "codex-1", Profile: "worker",
 		ProfileDigest: "sha256:" + strings.Repeat("b", 64), TokenID: strings.Repeat("c", 64),
 		Workload: "ip:127.0.0.1", Workspace: "/workspace-agent-1", Services: []string{"openai"},
-		HiveAgent: "codex-1@vm1",
-		Unit:      "forcefield-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service",
-		Status:    RunStarting, StartedAt: time.Unix(1_700_000_000, 0).UTC(),
+		HiveAgent: "codex-1@vm1", NetworkMode: "isolated",
+		Unit:   "forcefield-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service",
+		Status: RunStarting, StartedAt: time.Unix(1_700_000_000, 0).UTC(),
+	}
+}
+
+func TestReconcileRunRecordsMarksLostProcessFailed(t *testing.T) {
+	t.Parallel()
+	directory := filepath.Join(t.TempDir(), "state")
+	record := validRunRecord()
+	record.Status = RunRunning
+	record.SupervisorPID = 100
+	record.MainPID = 101
+	if err := WriteRunRecord(directory, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileRunRecords(directory, func(int) bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(filepath.Join(directory, record.SandboxID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got RunRecord
+	if err := json.Unmarshal(contents, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != RunFailed || got.Reason != "lost_process" || got.StoppedAt == nil {
+		t.Fatalf("reconciled record = %#v", got)
 	}
 }

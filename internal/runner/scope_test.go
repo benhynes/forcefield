@@ -53,7 +53,6 @@ func TestBuildSystemdScopeConstructsTransientService(t *testing.T) {
 		"--property=LimitNOFILE=1024",
 		"--property=KillMode=control-group",
 		"--property=NoNewPrivileges=yes",
-		"--property=PrivateDevices=yes",
 		"--pty",
 		"--",
 		command.Path,

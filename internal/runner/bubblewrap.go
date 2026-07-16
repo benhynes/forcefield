@@ -144,6 +144,12 @@ func BuildBubblewrap(spec LaunchSpec) (CommandSpec, error) {
 	args := []string{
 		"--die-with-parent",
 		"--unshare-all",
+	}
+	if spec.Profile.ShareNetwork {
+		args = append(args, "--share-net")
+	}
+	args = append(args,
+		"--unshare-user",
 		// systemd-run --pty provides a subordinate, mediated terminal. Preserve
 		// that controlling-terminal relationship for agent TUIs and shell job
 		// control; the inherited seccomp policy rejects TIOCSTI before the
@@ -158,7 +164,7 @@ func BuildBubblewrap(spec LaunchSpec) (CommandSpec, error) {
 		"--perms", "0700", "--tmpfs", "/run",
 		"--perms", "0700", "--tmpfs", "/home",
 		"--perms", "0700", "--dir", sandboxHome,
-	}
+	)
 	workspaceBind := "--bind"
 	if spec.Profile.WorkspaceReadOnly {
 		workspaceBind = "--ro-bind"

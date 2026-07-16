@@ -59,6 +59,9 @@ func runSandboxInit(args []string, stdin io.Reader, stdout, stderr io.Writer) er
 		return err
 	}
 	defer relay.Close()
+	if err := bindSandboxRelayEnvironment(relay.Address()); err != nil {
+		return err
+	}
 	if err := runner.InstallSandboxSeccomp(); err != nil {
 		return fmt.Errorf("install sandbox syscall policy: %w", err)
 	}
@@ -104,6 +107,22 @@ func runSandboxInit(args []string, stdin io.Reader, stdout, stderr io.Writer) er
 		return commandExitError{code: code, err: waitErr}
 	}
 	return waitErr
+}
+
+func bindSandboxRelayEnvironment(address string) error {
+	if address == "" {
+		return errors.New("sandbox relay did not report a listen address")
+	}
+	forcefieldURL := "http://" + address
+	if err := os.Setenv("FORCEFIELD_URL", forcefieldURL); err != nil {
+		return errors.New("set sandbox Forcefield URL")
+	}
+	if current := os.Getenv("HIVE_ADDR"); current != "" {
+		if err := os.Setenv("HIVE_ADDR", forcefieldURL+runner.HiveBrokerPrefix); err != nil {
+			return errors.New("set sandbox Hive URL")
+		}
+	}
+	return nil
 }
 
 func stopSandboxCommand(command *exec.Cmd, waited <-chan error, signal os.Signal) error {

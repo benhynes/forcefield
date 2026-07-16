@@ -33,6 +33,27 @@ func TestRunGitCredentialGet(t *testing.T) {
 	}
 }
 
+func TestRunGitCredentialAcceptsEOFImmediatelyAfterFields(t *testing.T) {
+	t.Parallel()
+	token := "ff_" + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := "protocol=https\nhost=forcefield.test:7902\npath=forgejo-git/org/repo.git\n"
+	var output bytes.Buffer
+	if err := runGitCredential([]string{
+		"--url", "https://forcefield.test:7902/forgejo-git",
+		"--token-file", tokenFile,
+		"get",
+	}, strings.NewReader(input), &output); err != nil {
+		t.Fatal(err)
+	}
+	if want := "username=forcefield\npassword=" + token + "\n\n"; output.String() != want {
+		t.Fatalf("output = %q, want %q", output.String(), want)
+	}
+}
+
 func TestRunGitCredentialDoesNotServeOutsideScope(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
@@ -91,7 +112,7 @@ func TestRunGitCredentialRejectsMalformedOrOversizedInput(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
 		"empty":              "",
-		"unterminated":       "protocol=https\nhost=forcefield.test\n",
+		"unterminated":       "protocol=https\nhost=forcefield.test",
 		"duplicate protocol": "protocol=https\nprotocol=https\nhost=forcefield.test\npath=forgejo-git/repo.git\n\n",
 		"compound url":       "url=https://forcefield.test/forgejo-git/repo.git\n\n",
 		"embedded record":    "protocol=https\n\nhost=forcefield.test\n\n",

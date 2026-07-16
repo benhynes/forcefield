@@ -44,6 +44,7 @@ func TestBuildBubblewrapConstructsFailClosedCommand(t *testing.T) {
 	wantArgs := []string{
 		"--die-with-parent",
 		"--unshare-all",
+		"--unshare-user",
 		"--disable-userns",
 		"--cap-drop", "ALL",
 		"--clearenv",
@@ -113,6 +114,25 @@ func TestBuildBubblewrapReadOnlyWorkspaceAndCanonicalPaths(t *testing.T) {
 	}
 	if containsArgTriple(spec.Args, "--bind", fixture.workspace, "/workspace") {
 		t.Fatalf("writable workspace bind survived read-only profile: %#v", spec.Args)
+	}
+}
+
+func TestBuildBubblewrapCanRetainTrustedHostNetwork(t *testing.T) {
+	fixture := newBubblewrapFixture(t)
+	profile := fixture.profile()
+	profile.ShareNetwork = true
+	spec, err := BuildBubblewrap(LaunchSpec{
+		Profile: profile, Workspace: fixture.workspace,
+		BrokerHostSocket: fixture.socket,
+		Executable:       "/usr/bin/agent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Args) < 4 || !reflect.DeepEqual(spec.Args[:4], []string{
+		"--die-with-parent", "--unshare-all", "--share-net", "--unshare-user",
+	}) {
+		t.Fatalf("network namespace args = %#v", spec.Args[:min(4, len(spec.Args))])
 	}
 }
 

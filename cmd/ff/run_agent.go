@@ -108,6 +108,9 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err := runner.PrepareStateDirectory(runnerConfig.StateDirectory); err != nil {
 		return err
 	}
+	if err := runner.ReconcileRunRecords(runnerConfig.StateDirectory, nil); err != nil {
+		return err
+	}
 	sensitivePaths := []string{profile.ClientKey, profile.TokenFile}
 	operatorFiles := []string{options.profilesPath}
 	if compiled != nil {
@@ -209,7 +212,7 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	record := runner.RunRecord{
 		Version: 1, SandboxID: sandboxID, Agent: options.agent, Profile: options.profile,
 		ProfileDigest: profileDigest, TokenID: tokenID, Workload: workload,
-		Workspace: workspace, Services: services, HiveAgent: hiveAgent, Unit: unit,
+		Workspace: workspace, Services: services, HiveAgent: hiveAgent, NetworkMode: runnerNetworkMode(profile), Unit: unit,
 		Status: runner.RunStarting, StartedAt: time.Now().Round(0).UTC(),
 	}
 	finalized := false
@@ -343,6 +346,13 @@ func runAgent(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return waitErr
 	}
 	return nil
+}
+
+func runnerNetworkMode(profile runner.Profile) string {
+	if profile.ShareNetwork {
+		return "host"
+	}
+	return "isolated"
 }
 
 func parseAgentRunOptions(args []string, output io.Writer) (agentRunOptions, bool, error) {

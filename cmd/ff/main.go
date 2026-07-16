@@ -70,6 +70,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runGitCredential(args[1:], stdin, stdout)
 	case "run":
 		return runAgent(args[1:], stdin, stdout, stderr)
+	case "runner":
+		return runRunner(args[1:], stdout, stderr)
 	case "_sandbox-init":
 		return runSandboxInit(args[1:], stdin, stdout, stderr)
 	case "version", "--version", "-version":
@@ -466,6 +468,7 @@ Usage:
   ff mcp --url FORCEFIELD_ORIGIN [--token-file PATH]
   ff git-credential --url FORCEFIELD_GIT_URL --token-file PATH get|store|erase
   ff run --config forcefield.yaml --profiles forcefield-runner.yaml --profile PROFILE --agent AGENT -- /absolute/agent-command
+  ff runner doctor --profiles forcefield-runner.yaml --profile PROFILE --workspace DIR
   ff version
 `)
 }

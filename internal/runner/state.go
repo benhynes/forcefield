@@ -38,13 +38,75 @@ type RunRecord struct {
 	Workspace     string     `json:"workspace"`
 	Services      []string   `json:"services"`
 	HiveAgent     string     `json:"hive_agent,omitempty"`
+	NetworkMode   string     `json:"network_mode"`
 	Unit          string     `json:"unit"`
 	Status        RunStatus  `json:"status"`
+	Reason        string     `json:"reason,omitempty"`
 	SupervisorPID int        `json:"supervisor_pid,omitempty"`
 	MainPID       int        `json:"main_pid,omitempty"`
 	ExitCode      *int       `json:"exit_code,omitempty"`
 	StartedAt     time.Time  `json:"started_at"`
 	StoppedAt     *time.Time `json:"stopped_at,omitempty"`
+}
+
+// ReconcileRunRecords marks starting/running records failed when neither their
+// main process nor supervisor still exists. It is safe to call before every
+// launch and turns crash-left "running" records into durable terminal state.
+func ReconcileRunRecords(directory string, processAlive func(int) bool) error {
+	if err := PrepareStateDirectory(directory); err != nil {
+		return err
+	}
+	if processAlive == nil {
+		processAlive = defaultProcessAlive
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return errors.New("read runner state directory")
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return errors.New("read runner state file")
+		}
+		var record RunRecord
+		if json.Unmarshal(contents, &record) != nil || validateRunRecord(record) != nil {
+			continue
+		}
+		if record.Status != RunStarting && record.Status != RunRunning {
+			continue
+		}
+		pid := record.MainPID
+		if pid == 0 {
+			pid = record.SupervisorPID
+		}
+		if pid > 0 && processAlive(pid) {
+			continue
+		}
+		now := time.Now().Round(0).UTC()
+		if record.NetworkMode == "" {
+			record.NetworkMode = "isolated"
+		}
+		record.Status = RunFailed
+		record.Reason = "lost_process"
+		record.StoppedAt = &now
+		record.ExitCode = nil
+		if err := WriteRunRecord(directory, record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func defaultProcessAlive(pid int) bool {
+	if pid < 1 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func NewSandboxID() (string, error) {
@@ -144,11 +206,17 @@ func validateRunRecord(record RunRecord) error {
 	if _, err := hex.DecodeString(strings.TrimPrefix(record.ProfileDigest, "sha256:")); err != nil {
 		return errors.New("invalid runner profile digest")
 	}
-	if len(record.TokenID) != 64 {
-		return errors.New("invalid runner token identifier")
-	}
-	if _, err := hex.DecodeString(record.TokenID); err != nil {
-		return errors.New("invalid runner token identifier")
+	if record.Workload == "remote-capability" {
+		if record.TokenID != "" {
+			return errors.New("invalid runner token identifier")
+		}
+	} else {
+		if len(record.TokenID) != 64 {
+			return errors.New("invalid runner token identifier")
+		}
+		if _, err := hex.DecodeString(record.TokenID); err != nil {
+			return errors.New("invalid runner token identifier")
+		}
 	}
 	if record.Workload == "" || !filepath.IsAbs(record.Workspace) || filepath.Clean(record.Workspace) != record.Workspace {
 		return errors.New("invalid runner workload or workspace")
@@ -158,6 +226,12 @@ func validateRunRecord(record RunRecord) error {
 	}
 	if record.HiveAgent != "" && (!validHiveAddress(record.HiveAgent) || !strings.Contains(record.HiveAgent, "@")) {
 		return errors.New("invalid runner Hive identity")
+	}
+	if record.NetworkMode != "" && record.NetworkMode != "isolated" && record.NetworkMode != "host" {
+		return errors.New("invalid runner network mode")
+	}
+	if len(record.Reason) > 128 || strings.IndexFunc(record.Reason, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return errors.New("invalid runner stop reason")
 	}
 	if !validSystemdUnit(record.Unit) {
 		return errors.New("invalid runner systemd unit")

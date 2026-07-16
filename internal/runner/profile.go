@@ -109,6 +109,7 @@ type Profile struct {
 	BrokerSocket      string      `json:"broker_socket" yaml:"broker_socket"`
 	BrokerListen      string      `json:"broker_listen" yaml:"broker_listen"`
 	WorkspaceReadOnly bool        `json:"workspace_read_only" yaml:"workspace_read_only"`
+	ShareNetwork      bool        `json:"share_network,omitempty" yaml:"share_network,omitempty"`
 	ReadOnlyMounts    []Mount     `json:"read_only_mounts,omitempty" yaml:"read_only_mounts,omitempty"`
 	Environment       Environment `json:"environment,omitempty" yaml:"environment,omitempty"`
 	Hive              HiveConfig  `json:"hive,omitempty" yaml:"hive,omitempty"`
@@ -179,6 +180,7 @@ type rawProfile struct {
 	BrokerSocket      string       `yaml:"broker_socket"`
 	BrokerListen      string       `yaml:"broker_listen"`
 	WorkspaceReadOnly *bool        `yaml:"workspace_read_only,omitempty"`
+	ShareNetwork      bool         `yaml:"share_network,omitempty"`
 	ReadOnlyMounts    []Mount      `yaml:"read_only_mounts,omitempty"`
 	Environment       Environment  `yaml:"environment,omitempty"`
 	Hive              HiveConfig   `yaml:"hive,omitempty"`
@@ -403,6 +405,7 @@ func compileRawProfile(source rawProfile) (Profile, error) {
 		ClientCert: source.ClientCert, ClientKey: source.ClientKey,
 		RootFS: source.RootFS, WorkspaceTarget: source.WorkspaceTarget,
 		BrokerSocket: source.BrokerSocket, BrokerListen: source.BrokerListen,
+		ShareNetwork:   source.ShareNetwork,
 		ReadOnlyMounts: append([]Mount(nil), source.ReadOnlyMounts...),
 		Environment: Environment{
 			Inherit: append([]string(nil), source.Environment.Inherit...),
@@ -670,7 +673,7 @@ func canonicalLoopbackListen(value string) (string, error) {
 		return "", errors.New("broker_listen must include a loopback host and numeric port")
 	}
 	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65_535 || strconv.Itoa(portNumber) != port {
+	if err != nil || portNumber < 0 || portNumber > 65_535 || strconv.Itoa(portNumber) != port {
 		return "", errors.New("broker_listen has an invalid port")
 	}
 	host = strings.ToLower(host)
